@@ -791,6 +791,19 @@ def roster_entry_for(db: Session, username: str) -> RosterEntry | None:
     )
 
 
+def roster_entry_for_canvas_user(db: Session, canvas_user_id: int) -> RosterEntry | None:
+    """Find a student by Canvas user id in any synced roster.
+
+    What Canvas login authenticates is a Canvas account, not a username — this
+    is the other half of the mapping `RosterEntry` exists for. Any roster, for
+    the same reason as `roster_entry_for`: which course a student is logging
+    in for is not something they should have to choose.
+    """
+    return db.scalar(
+        select(RosterEntry).where(RosterEntry.canvas_user_id == canvas_user_id).limit(1)
+    )
+
+
 def course_roster(db: Session, course_id: int) -> list[RosterEntry]:
     return list(
         db.scalars(

@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from starlette.responses import RedirectResponse
 
-from .. import oidc, service
+from .. import canvas_oauth, oidc, service
 from ..auth import (
     DEVICE_COOKIE,
     clear_flow_cookie,
@@ -40,9 +40,17 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 # there is no way for the two to drift apart.
 CALLBACK_PATH = "/api/auth/callback"
 
+# Likewise registered in the Canvas Developer Key's redirect-URI allowlist —
+# same reasoning, same derivation.
+CANVAS_CALLBACK_PATH = "/api/auth/canvas-callback"
+
 
 def _redirect_uri(request: Request, settings: Settings) -> str:
     return public_base_url(request, settings) + CALLBACK_PATH
+
+
+def _canvas_redirect_uri(request: Request, settings: Settings) -> str:
+    return public_base_url(request, settings) + CANVAS_CALLBACK_PATH
 
 
 def _safe_next(target: str) -> str:
@@ -151,6 +159,7 @@ def login_methods(settings: Settings = Depends(get_settings)) -> dict:
         "mock_login": settings.mock_login_allowed,
         "roster_login": settings.roster_login_allowed,
         "oidc": settings.oidc_configured,
+        "canvas_oauth": settings.canvas_oauth_configured,
     }
 
 
@@ -379,6 +388,110 @@ def oidc_callback(
         claims, entry.display_name if entry else username
     )
     user = get_or_create_user(db, username, display_name, settings)
+
+    response = RedirectResponse(
+        flow.get("next") or "/", status_code=status.HTTP_303_SEE_OTHER
+    )
+    set_session_cookie(response, user.username, settings)
+    clear_flow_cookie(response)
+    return response
+
+
+@router.get("/canvas-login")
+def canvas_login(
+    request: Request,
+    next: str = "/",
+    settings: Settings = Depends(get_settings),
+) -> RedirectResponse:
+    """Start the Canvas OAuth2 flow.
+
+    Canvas itself is where SWAMID is spoken; this app only ever talks to
+    Canvas. The state and the return path are carried the same way the OIDC
+    flow carries them — a short-lived signed cookie, not server-side state —
+    for the same reason: it survives a restart mid-login and needs no shared
+    store across replicas.
+    """
+    if not settings.canvas_oauth_configured:
+        raise HTTPException(
+            status.HTTP_501_NOT_IMPLEMENTED,
+            "Canvas login is not configured. Set CANVAS_OAUTH_CLIENT_ID and "
+            "CANVAS_OAUTH_CLIENT_SECRET from a Canvas Developer Key.",
+        )
+    state = secrets.token_urlsafe(24)
+    response = RedirectResponse(
+        canvas_oauth.authorization_url(
+            settings.canvas_base_url,
+            settings.canvas_oauth_client_id,
+            _canvas_redirect_uri(request, settings),
+            state,
+        ),
+        status_code=status.HTTP_307_TEMPORARY_REDIRECT,
+    )
+    set_flow_cookie(response, {"state": state, "next": _safe_next(next)}, settings)
+    return response
+
+
+@router.get("/canvas-callback")
+def canvas_callback(
+    request: Request,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+) -> RedirectResponse:
+    """Where Canvas sends the student back, signed in or not.
+
+    Identification, not a password: Canvas has already authenticated this
+    person through SWAMID before this ever runs, so there is no device-binding
+    or one-identity-per-device check here the way roster-login needs one —
+    that check exists only because roster-login accepts an unproven typed
+    email address.
+    """
+    if not settings.canvas_oauth_configured:
+        raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, "Canvas login is not configured")
+
+    if error:
+        log.warning("canvas oauth: provider returned %s", error)
+        return RedirectResponse("/login?error=canvas", status_code=status.HTTP_303_SEE_OTHER)
+
+    flow = read_flow_cookie(request, settings)
+    if flow is None or not state or not secrets.compare_digest(state, flow.get("state", "")):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Login session expired; try again")
+    if not code:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "No authorization code returned")
+
+    try:
+        tokens = canvas_oauth.exchange_code(
+            settings.canvas_base_url,
+            code,
+            _canvas_redirect_uri(request, settings),
+            settings.canvas_oauth_client_id,
+            settings.canvas_oauth_client_secret,
+        )
+        access_token = tokens.get("access_token")
+        if not access_token:
+            raise canvas_oauth.CanvasOAuthError("No access token in the token response")
+        canvas_user = canvas_oauth.fetch_self(settings.canvas_base_url, access_token)
+    except canvas_oauth.CanvasOAuthError as e:
+        log.error("canvas oauth: %s", e)
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e))
+
+    canvas_user_id = canvas_user.get("id")
+    if not isinstance(canvas_user_id, int):
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Canvas returned no user id")
+
+    entry = service.roster_entry_for_canvas_user(db, canvas_user_id)
+    if entry is None:
+        # Same reasoning as the roster-login 401: this must not become a way
+        # to test who is enrolled, but here the caller has already proven who
+        # they are via SWAMID, so naming the actual problem costs nothing.
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Your Canvas account is not on the course roster. Ask the teacher "
+            "if you have only just registered.",
+        )
+    user = get_or_create_user(db, entry.username, entry.display_name, settings)
 
     response = RedirectResponse(
         flow.get("next") or "/", status_code=status.HTTP_303_SEE_OTHER

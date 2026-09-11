@@ -155,6 +155,17 @@ class Settings(BaseSettings):
     # `sub`, which KTH issues pairwise and is therefore not a username.
     oidc_username_claim: str = "upn"
 
+    # Canvas OAuth2 — student login through Canvas rather than through a
+    # university IdP. SU's own IdP speaks SAML through SWAMID and not OIDC;
+    # Canvas already sits in front of SWAMID (canvas.su.se), so this reuses
+    # that trust instead of the app speaking SAML itself. `canvas_base_url`
+    # above supplies the host; these are the OAuth2 application's own
+    # credentials, from a Developer Key created by the Canvas admin (Admin ->
+    # Developer Keys), distinct from the personal access token used for the
+    # roster sync.
+    canvas_oauth_client_id: str = ""
+    canvas_oauth_client_secret: str = ""
+
     @property
     def teachers(self) -> set[str]:
         return {u.strip() for u in self.teacher_usernames.split(",") if u.strip()}
@@ -184,6 +195,12 @@ class Settings(BaseSettings):
     @property
     def oidc_configured(self) -> bool:
         return bool(self.oidc_issuer and self.oidc_client_id and self.oidc_client_secret)
+
+    @property
+    def canvas_oauth_configured(self) -> bool:
+        return bool(
+            self.canvas_oauth_client_id and self.canvas_oauth_client_secret and self.canvas_base_url
+        )
 
     @property
     def roster_login_allowed(self) -> bool:
