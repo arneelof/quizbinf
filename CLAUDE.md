@@ -176,6 +176,18 @@ quizbinf/
   the sessionmaker sets `expire_on_commit=False`, so the endpoint can still
   read the user's attributes without another query), and `events()` closes its
   session before it awaits *anything*, not merely before it streams.
+- **The connection pool and the write gate are not the same kind of thing,
+  and only one of them is SQLite's.** `POOL_SIZE` applies to every backend —
+  it used to be set inside the SQLite branch, so pointing `DATABASE_URL` at
+  Postgres fell back to SQLAlchemy's defaults of five plus ten overflow,
+  fifteen connections against forty request slots, which is exactly the
+  exhaustion failure the constant exists to prevent. A 200-student run against
+  Postgres peaks at **39 checked out**, so that migration would have broken on
+  its first busy lecture and looked like a new problem. The `writing()` gate is
+  the opposite: it exists because SQLite permits one writer at a time and
+  arbitrates badly between contenders, and `_serialise_writes` turns it off for
+  anything else. Leaving it on under Postgres would serialise every write in
+  this process and discard MVCC — the single largest reason to move there.
 - **The lecture-hall settings live in `app/db.py`,** and the defaults they
   replace are what made the app slow in front of a class. SQLite runs in
   **WAL** mode — without it a single writer blocks every reader, so one
@@ -281,6 +293,15 @@ quizbinf/
   be diagnosed from the list of requests it refused. It now logs the measured
   in-flight count, and any database request holding a slot longer than
   `SLOW_REQUEST_SECONDS` is logged with its path, duration and the pool stats.
+- **`GET /api/health` must not do I/O, and that includes the filesystem.** It
+  reported whether the data directory is writable, which costs a `mkdir`, a
+  `touch` and an `unlink` — three round trips to a network filesystem, on
+  every request, on the volume most likely to *be* what is stuck. Measured
+  against the deployment with one client and nothing else running,
+  `/api/health` reached 1.4 s while a static file on the same host never
+  passed 0.2 s. The answer is cached for `Settings.WRITABILITY_TTL`, with an
+  expiry rather than once at startup because a volume going read-only
+  mid-lecture is exactly what the reading is for.
 - **`GET /api/health` reports the connection pool and the journal mode.** The
   freeze is invisible from outside — requests stop being answered while health
   keeps saying ok, because it needs no database — so `checked_out` pinned at
@@ -576,6 +597,18 @@ URL so the QR code resolves. See the README.
   cd backend && python -m loadtest.lecture --base-url http://localhost:8000
   ```
 
+  **`loadtest/ingress.py` asks the narrower question**, and exists because the
+  people who need its answer run the platform rather than this app: it needs
+  no login, no database and no setup, touching only `GET /api/health` (an
+  `async def` over in-memory counters, exempt from the cap) and the SPA's HTML
+  off disk. A stall there happened before the application did any work. It
+  lists every slow request with its wall-clock time so the moments can be
+  lined up against an ingress log, and — having caught itself doing this on
+  its first run — it says so when the queue is its own: all the clients share
+  one interpreter lock, so the tell is slow requests that all *finish* within
+  a second of each other. `--clients 1` is the control, since a single client
+  cannot queue behind itself.
+
   Read it for *relative* signals — one endpoint far slower than the rest, a p99
   an order of magnitude past its p50, a 500, a pool pinned at its limit — and
   not for absolute capacity: the server and 150 Python clients share one
@@ -663,6 +696,36 @@ URL so the QR code resolves. See the README.
   a latency column; nothing the app exposed could tell them apart. Take a
   backup and check it (`PRAGMA integrity_check`) when you take it, not when
   you need it.
+
+  **`python -m tools.copy_database` moves the data, and the backup uses the
+  same code.** One implementation serves both directions: off SQLite onto a
+  PostgreSQL server, and — when the deployment's database *is* PostgreSQL —
+  into the SQLite file that `GET /api/backup.zip` hands over. That endpoint
+  used to refuse anything but SQLite and advise `pg_dump`, which is advice
+  rather than a backup: the teacher has a browser and a session cookie, not a
+  shell on the database host, so moving to PostgreSQL would have quietly taken
+  away the one button that rescues this app's data. The archive keeps its
+  shape on every backend, and its README says which of three kinds of copy it
+  holds — vacuumed, raw, or copied from another database — because they are
+  read months later by somebody in a hurry and must not look alike. The copied
+  kind carries the ORM's tables and nothing else, so it says plainly that it
+  is not a substitute for a dump taken on the host.
+
+  **Ids travel unchanged, so PostgreSQL's sequences have to be moved past
+  them.** Answers reference round ids and rounds reference question ids;
+  renumbering would break those or require rewriting every one. A sequence
+  knows nothing about rows inserted with an explicit id, so without
+  `_reset_sequences` the very next INSERT reuses id 1 and fails — which here
+  is the first student to answer in the first lecture after the migration. The
+  copy is verified by counting both ends afterwards rather than trusting the
+  loop's own total: a copy that silently moved nothing looks like success from
+  the inside.
+
+  **A remote database with no TLS is warned about at startup.** The connection
+  to another host carries every student's name and answer, and the database
+  password with them. A warning and not a refusal, because the same URL shape
+  is right for the Postgres container beside the app in `docker-compose`,
+  where there is no network to cross — `sslmode=require` is what silences it.
 
   **SQLite's locking is unreliable on a network filesystem, and WAL does not
   work on one at all** — it needs real shared memory for the `-shm` file. If
@@ -839,7 +902,7 @@ alembic upgrade head
 | `GET /api/sessions/{code}/questions/{id}/comparison` | teacher | pre vs post counts |
 | `GET /api/sessions/{code}/questions/{id}/discussants?count=` | teacher | draw students at random from those who answered — **names only** |
 | `DELETE /api/sessions/{code}/questions/{id}/rounds` | teacher | reset a question — **discards its answers** so it can be run again |
-| `GET /api/backup.zip` | teacher | the whole volume: database, figures, config with secrets redacted |
+| `GET /api/backup.zip` | teacher | the whole volume: database, figures, config with secrets redacted — works on any backend |
 | `POST /api/images` | teacher | upload a figure; returns Markdown to paste |
 | `POST /api/markdown/preview` | teacher | render Markdown for the authoring preview |
 | `GET /api/sessions/{code}/state` | student | full state snapshot (resync) |
