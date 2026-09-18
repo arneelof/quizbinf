@@ -86,6 +86,21 @@ def get_open_round(db: Session, session: QuizSession) -> Round | None:
     )
 
 
+def get_last_closed_round(db: Session, session: QuizSession) -> Round | None:
+    """Most recently closed round in this session, for showing students the
+
+    result on their own device once the teacher halts submissions. Callers
+    should only use this when `get_open_round` is None — a closed round from
+    earlier in the session should not resurface once a new one has opened.
+    """
+    return db.scalar(
+        select(Round)
+        .where(Round.session_id == session.id, Round.closed_at.is_not(None))
+        .order_by(Round.closed_at.desc())
+        .limit(1)
+    )
+
+
 def submit_answer(db: Session, round_: Round, user: User, choice: Choice) -> Answer:
     """Record `user`'s answer; one answer per user per round, last write wins
     while the round is open."""

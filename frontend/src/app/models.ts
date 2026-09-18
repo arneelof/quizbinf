@@ -46,6 +46,13 @@ export interface SessionState {
   open_round: Round | null;
   question: Question | null;
   my_choice_id: number | null;
+  // Populated only while no round is open, so a student's own device can
+  // show the same bar chart the teacher's Report view reveals once
+  // submissions are halted. Optional (not just nullable) so existing mocks
+  // that predate this field keep compiling.
+  closed_round?: Round | null;
+  closed_round_question?: Question | null;
+  closed_round_histogram?: Record<number, number> | null;
 }
 
 export interface Histogram {

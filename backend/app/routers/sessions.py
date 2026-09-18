@@ -56,6 +56,19 @@ def _state(db: Session, session: QuizSession, user: User | None) -> SessionState
             )
         )
         my_choice_id = answer.choice_id if answer else None
+
+    # Once a round is halted and nothing new has opened yet, students see the
+    # same bar chart the teacher's Report view does — see SessionState's
+    # docstring for why this only fires while open_round is None.
+    closed_round = None
+    closed_round_question = None
+    closed_round_histogram = None
+    if open_round is None:
+        closed_round = service.get_last_closed_round(db, session)
+        if closed_round is not None:
+            closed_round_question = closed_round.question
+            closed_round_histogram = service.round_histogram(db, closed_round)
+
     return SessionState(
         code=session.code,
         # The teacher view loads the session's questions from this; matching on
@@ -65,6 +78,9 @@ def _state(db: Session, session: QuizSession, user: User | None) -> SessionState
         open_round=RoundOut.model_validate(open_round) if open_round else None,
         question=question,
         my_choice_id=my_choice_id,
+        closed_round=RoundOut.model_validate(closed_round) if closed_round else None,
+        closed_round_question=closed_round_question,
+        closed_round_histogram=closed_round_histogram,
     )
 
 

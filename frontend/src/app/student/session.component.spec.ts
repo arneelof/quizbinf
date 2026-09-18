@@ -114,3 +114,80 @@ describe('StudentSessionComponent answering under load', () => {
 
   afterEach(() => http.verify());
 });
+
+describe('StudentSessionComponent showing results after the teacher halts submissions', () => {
+  let component: StudentSessionComponent;
+
+  beforeEach(() => {
+    TestBed.configureTestingModule({
+      providers: [
+        ApiService,
+        AuthService,
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        { provide: Router, useValue: { navigate: () => {} } },
+        {
+          provide: ActivatedRoute,
+          useValue: { snapshot: { paramMap: { get: () => 'abc123' } } },
+        },
+      ],
+    });
+    component = TestBed.runInInjectionContext(
+      () =>
+        new StudentSessionComponent(
+          TestBed.inject(ApiService),
+          TestBed.inject(AuthService),
+          TestBed.inject(ActivatedRoute),
+          TestBed.inject(Router),
+        ),
+    );
+  });
+
+  it('has nothing to show before any round has closed', () => {
+    component.state.set({
+      code: 'abc123',
+      quiz_id: 1,
+      quiz_title: 'Bioinf',
+      open_round: null,
+      question: null,
+      my_choice_id: null,
+    });
+    expect(component.histTotal()).toBe(0);
+    expect(component.pct(1)).toBe(0);
+  });
+
+  it('turns the closed round\'s histogram into bar percentages', () => {
+    component.state.set({
+      code: 'abc123',
+      quiz_id: 1,
+      quiz_title: 'Bioinf',
+      open_round: null,
+      question: null,
+      my_choice_id: 21,
+      closed_round: { id: 5, question_id: 9, phase: 'pre' as any, opened_at: '', closed_at: '' },
+      closed_round_question: {
+        id: 9,
+        position: 0,
+        text: 'q',
+        text_html: '<p>q</p>',
+        image_url: null,
+        choices: [
+          { id: 21, position: 0, text: 'A' },
+          { id: 22, position: 1, text: 'B' },
+        ],
+      } as any,
+      // JSON turns dict[int, int] keys into strings; the component must not
+      // assume they arrive as numbers.
+      closed_round_histogram: { 21: 3, 22: 1 } as any,
+    });
+
+    expect(component.histTotal()).toBe(4);
+    expect(component.count(21)).toBe(3);
+    expect(component.count(22)).toBe(1);
+    expect(component.pct(21)).toBe(75);
+    expect(component.pct(22)).toBe(25);
+    // A choice nobody answered is 0, not undefined/NaN.
+    expect(component.count(999)).toBe(0);
+    expect(component.pct(999)).toBe(0);
+  });
+});

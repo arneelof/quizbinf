@@ -176,6 +176,13 @@ class SessionState(BaseModel):
     open_round: RoundOut | None
     question: QuestionOut | None  # the open round's question, choices unmarked
     my_choice_id: int | None = None
+    # Populated only while no round is open, so a student's own device can
+    # show the same bar chart the teacher's Report view reveals once
+    # submissions are halted. Cleared the moment a new round opens (a round
+    # from earlier in the session never resurfaces here).
+    closed_round: RoundOut | None = None
+    closed_round_question: QuestionOut | None = None
+    closed_round_histogram: dict[int, int] | None = None
 
 
 class HistogramOut(BaseModel):

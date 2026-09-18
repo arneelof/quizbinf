@@ -44,6 +44,21 @@ const SEND_BACKOFF_MS = 400;
           } @else if (selected()) {
             <p class="saved">Answer saved — you can change it while the question is open.</p>
           }
+        } @else if (s.closed_round_histogram && s.closed_round_question; as cq) {
+          <p class="phase">Results</p>
+          <div class="qtext" [innerHTML]="cq.text_html"></div>
+          <div class="hist">
+            @for (c of cq.choices; track c.id) {
+              <div class="row" [class.mine]="selected() === c.id">
+                <span class="label">{{ c.text }}</span>
+                <span class="bar-line">
+                  <span class="bar" [style.width.%]="pct(c.id)"></span>
+                  <span class="n">{{ count(c.id) }}</span>
+                </span>
+              </div>
+            }
+          </div>
+          <p class="total">{{ histTotal() }} answer(s)</p>
         } @else {
           <p class="waiting">Waiting for the teacher to open a question…</p>
         }
@@ -73,6 +88,13 @@ const SEND_BACKOFF_MS = 400;
       .saved { color: #2c7; margin-top: 1rem; }
       .sending { color: #777; margin-top: 1rem; }
       .error { color: #c0392b; }
+      .hist { display: flex; flex-direction: column; gap: 0.7rem; margin-top: 0.5rem; }
+      .hist .row.mine .label { font-weight: 700; }
+      .hist .label { display: block; margin-bottom: 0.2rem; }
+      .bar-line { display: flex; align-items: center; gap: 0.5rem; }
+      .bar { height: 1.2rem; background: #2c7; border-radius: 3px; min-width: 2px; }
+      .n { color: #555; font-size: 0.9rem; min-width: 1.2rem; }
+      .total { color: #777; font-size: 0.9rem; margin-top: 0.8rem; }
     `,
   ],
 })
@@ -107,6 +129,24 @@ export class StudentSessionComponent implements OnInit, OnDestroy {
 
   ngOnDestroy(): void {
     this.teardown?.();
+  }
+
+  /** Answers for one choice, once the round is closed and the histogram is in. */
+  count(choiceId: number): number {
+    const hist = this.state()?.closed_round_histogram;
+    return hist ? hist[choiceId] || 0 : 0;
+  }
+
+  histTotal(): number {
+    const hist = this.state()?.closed_round_histogram;
+    if (!hist) return 0;
+    return Object.values(hist).reduce((sum, n) => sum + n, 0);
+  }
+
+  /** Bar width as a percentage of the total answers, 0 when nobody answered. */
+  pct(choiceId: number): number {
+    const total = this.histTotal();
+    return total === 0 ? 0 : (this.count(choiceId) / total) * 100;
   }
 
   private resync(): void {
