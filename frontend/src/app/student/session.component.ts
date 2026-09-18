@@ -44,23 +44,25 @@ const SEND_BACKOFF_MS = 400;
           } @else if (selected()) {
             <p class="saved">Answer saved — you can change it while the question is open.</p>
           }
-        } @else if (s.closed_round_histogram && s.closed_round_question; as cq) {
-          <p class="phase">Results</p>
-          <div class="qtext" [innerHTML]="cq.text_html"></div>
-          <div class="hist">
-            @for (c of cq.choices; track c.id) {
-              <div class="row" [class.mine]="selected() === c.id">
-                <span class="label">{{ c.text }}</span>
-                <span class="bar-line">
-                  <span class="bar" [style.width.%]="pct(c.id)"></span>
-                  <span class="n">{{ count(c.id) }}</span>
-                </span>
-              </div>
-            }
-          </div>
-          <p class="total">{{ histTotal() }} answer(s)</p>
         } @else {
-          <p class="waiting">Waiting for the teacher to open a question…</p>
+          @if (s.closed_round_histogram && s.closed_round_question; as cq) {
+            <p class="phase">Results</p>
+            <div class="qtext" [innerHTML]="cq.text_html"></div>
+            <div class="hist">
+              @for (c of cq.choices; track c.id) {
+                <div class="row" [class.mine]="selected() === c.id">
+                  <span class="label">{{ c.text }}</span>
+                  <span class="bar-line">
+                    <span class="bar" [style.width.%]="pct(c.id)"></span>
+                    <span class="n">{{ count(c.id) }}</span>
+                  </span>
+                </div>
+              }
+            </div>
+            <p class="total">{{ histTotal() }} answer(s)</p>
+          } @else {
+            <p class="waiting">Waiting for the teacher to open a question…</p>
+          }
         }
       } @else if (error()) {
         <p class="error">{{ error() }}</p>
