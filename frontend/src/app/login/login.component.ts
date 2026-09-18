@@ -84,7 +84,7 @@ import { AuthService } from '../auth.service';
       @if (methods()?.mock_login) {
         <!-- Development-only login that skips the IdP entirely. -->
         <div class="mock">
-          <label>KTH username (mock login)</label>
+          <label>Your name (type anything — no account needed)</label>
           <input [(ngModel)]="username" placeholder="e.g. lukask" (keyup.enter)="login()" />
           <button (click)="login()" [disabled]="!username.trim()">Log in</button>
           @if (error && !methods()?.roster_login) {
