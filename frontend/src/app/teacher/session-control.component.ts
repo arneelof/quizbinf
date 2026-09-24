@@ -106,6 +106,8 @@ const POLL_MS = 2000;
       .choices { margin: 0.3rem 0 0.5rem; padding-left: 1.4rem; color: #333; }
       .choices li { margin: 0.1rem 0; }
       .choices li.correct { font-weight: 700; color: #2c7; }
+      .mode-tag { font-size: 0.75rem; color: #777; border: 1px solid #ddd; border-radius: 10px;
+                  padding: 0.1rem 0.5rem; align-self: center; }
       .reveal { font-size: 0.75rem; padding: 0.15rem 0.45rem; margin-bottom: 0.5rem;
                 color: #777; background: none; }
       .show-all { font-size: 0.85rem; margin-top: 0.8rem; }

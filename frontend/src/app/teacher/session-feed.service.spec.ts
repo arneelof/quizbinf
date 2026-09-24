@@ -176,3 +176,46 @@ describe('TeacherSessionReportComponent', () => {
     expect(report.revealCorrect(q1)).toBeTrue();
   });
 });
+
+describe('SessionFeed question modes', () => {
+  let feed: SessionFeed;
+  const once: Question = { ...question(1, 0), mode: 'once' };
+  const hidden: Question = { ...question(2, 1), mode: 'twice_end' };
+  const each: Question = { ...question(3, 2), mode: 'twice' };
+
+  beforeEach(() => {
+    TestBed.configureTestingModule({
+      providers: [SessionFeed, ApiService, provideHttpClient(), provideHttpClientTesting()],
+    });
+    feed = TestBed.inject(SessionFeed);
+    feed.questions.set([once, hidden, each]);
+  });
+
+  it('treats a question without a mode as asked twice', () => {
+    expect(feed.mode(question(9, 0))).toBe('twice');
+  });
+
+  it('finishes a question asked once after its only round', () => {
+    feed.comparisons.set({ 1: comparison(1, true), 2: comparison(2), 3: comparison(3) });
+    expect(feed.finished(once)).toBeTrue();
+    // ...so the projection moves on instead of waiting for a discussion.
+    expect(feed.currentQuestion()?.id).toBe(2);
+    expect(feed.stage()).toBe('waiting');
+  });
+
+  it('holds back the first result of a twice_end question until the second is halted', () => {
+    feed.comparisons.set({ 1: comparison(1, true), 2: comparison(2, true), 3: comparison(3) });
+    expect(feed.showPhase(hidden, 'pre')).toBeFalse();
+    expect(feed.stage()).toBe('discuss');
+
+    feed.comparisons.set({ 1: comparison(1, true), 2: comparison(2, true, true), 3: comparison(3) });
+    expect(feed.showPhase(hidden, 'pre')).toBeTrue();
+    expect(feed.showPhase(hidden, 'post')).toBeTrue();
+  });
+
+  it('shows the first result of a twice question straight away', () => {
+    feed.comparisons.set({ 1: comparison(1), 2: comparison(2), 3: comparison(3, true) });
+    expect(feed.showPhase(each, 'pre')).toBeTrue();
+    expect(feed.finished(each)).toBeFalse();
+  });
+});

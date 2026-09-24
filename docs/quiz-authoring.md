@@ -26,6 +26,8 @@ authoring UI. A figure can go here too:
 
 ## Which gate did the two-input example (w0=0.9, w1=-0.6, w2=-0.5) implement?
 
+mode: twice-end
+
 - [ ] AND
 - [ ] OR
 - [x] NAND
@@ -50,6 +52,17 @@ Rules, matching what `app/schemas.py` enforces server-side:
   through `POST /api/images` and rewritten to the URL the server returns.
   `{width=NN%}` / `{width=NN}` after the image — the general attrs syntax
   `app/markdown.py` already supports — carries through unchanged.
+- An optional `mode:` line on its own, anywhere in a question's block, sets
+  how that question is run. It is not part of the question text.
+
+  | Line | Rounds | Students and the projected report see results |
+  |------|--------|-----------------------------------------------|
+  | *(none)* or `mode: twice` | pre and post | after each round |
+  | `mode: twice-end` | pre and post | only after the second round, then both rounds |
+  | `mode: once` | one | after that round |
+
+  The correct choice is marked on the report once the question's last round
+  has been halted. The mode can also be changed later in the question editor.
 - Anything before the `#` title is ignored, so a chapter's own notes or a
   changelog above the quiz content do not need to be stripped out first.
 

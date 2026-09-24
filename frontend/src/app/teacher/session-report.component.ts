@@ -9,7 +9,8 @@ import { SessionFeed } from './session-feed.service';
  * The projected results: how the class answered before and after discussing.
  *
  * A phase appears only once its round is halted, so this view is safe to leave
- * on the projector for a whole question.
+ * on the projector for a whole question. For a `twice_end` question the first
+ * phase waits for the second to be halted too (see SessionFeed.showPhase).
  *
  * Two things it holds back. Which choice is correct stays hidden until the
  * second bout has run — the pre distribution is projected *before* the
@@ -56,6 +57,8 @@ import { SessionFeed } from './session-feed.service';
               <p class="pending">
                 @if (feed.openRoundFor(q)) {
                   Answers are open — results appear when you halt the round.
+                } @else if (feed.ran(q, 'pre')) {
+                  Discuss — results from both rounds appear after the second.
                 } @else {
                   Not asked yet.
                 }
@@ -85,11 +88,15 @@ import { SessionFeed } from './session-feed.service';
                   </div>
                 }
                 <p class="legend">
-                  <span class="sw pre"></span> before discussion
-                  ({{ feed.total(c.pre) }})
-                  &nbsp;&nbsp;
-                  <span class="sw post"></span> after discussion
-                  ({{ feed.total(c.post) }})
+                  @if (feed.mode(q) === 'once') {
+                    <span class="sw pre"></span> answers ({{ feed.total(c.pre) }})
+                  } @else {
+                    <span class="sw pre"></span> before discussion
+                    ({{ feed.total(c.pre) }})
+                    &nbsp;&nbsp;
+                    <span class="sw post"></span> after discussion
+                    ({{ feed.total(c.post) }})
+                  }
                 </p>
 
                 <div class="draw">
@@ -176,12 +183,13 @@ export class TeacherSessionReportComponent {
   /**
    * Whether the correct choice may be marked yet.
    *
-   * Only once the second bout has been halted. Before that this view is
+   * Only once the question's last round has been halted: the second bout,
+   * or the only one for a question asked once. Before that this view is
    * projected between the two bouts, and the point of asking twice is that the
    * class argues it out rather than reading the answer off the screen.
    */
   revealCorrect(q: Question): boolean {
-    return this.feed.ran(q, 'post');
+    return this.feed.finished(q);
   }
 
   /** Whether a draw has already produced names for this question. */

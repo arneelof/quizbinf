@@ -20,7 +20,13 @@ const SEND_BACKOFF_MS = 400;
 
         @if (s.open_round && s.question) {
           <p class="phase">
-            {{ s.open_round.phase === 'pre' ? 'First answer' : 'Answer again after discussion' }}
+            {{
+              s.question.mode === 'once'
+                ? 'Answer'
+                : s.open_round.phase === 'pre'
+                  ? 'First answer'
+                  : 'Answer again after discussion'
+            }}
           </p>
           <div class="qtext" [innerHTML]="s.question.text_html"></div>
           @if (s.question.image_url) {
@@ -52,6 +58,13 @@ const SEND_BACKOFF_MS = 400;
               @for (c of cq.choices; track c.id) {
                 <div class="row" [class.mine]="selected() === c.id">
                   <span class="label">{{ c.text }}</span>
+                  <!-- After a second round, both are shown: first above, second below. -->
+                  @if (s.closed_round_pre_histogram; as pre) {
+                    <span class="bar-line">
+                      <span class="bar first" [style.width.%]="pct(c.id, pre)"></span>
+                      <span class="n">{{ count(c.id, pre) }}</span>
+                    </span>
+                  }
                   <span class="bar-line">
                     <span class="bar" [style.width.%]="pct(c.id)"></span>
                     <span class="n">{{ count(c.id) }}</span>
@@ -59,7 +72,20 @@ const SEND_BACKOFF_MS = 400;
                 </div>
               }
             </div>
-            <p class="total">{{ histTotal() }} answer(s)</p>
+            @if (s.closed_round_pre_histogram; as pre) {
+              <p class="total">
+                <span class="sw first"></span> first answers ({{ histTotal(pre) }})
+                &nbsp; <span class="sw"></span> after discussion ({{ histTotal() }})
+              </p>
+            } @else {
+              <p class="total">{{ histTotal() }} answer(s)</p>
+            }
+          } @else if (s.closed_round?.phase === 'pre' && s.closed_round_question?.mode === 'twice_end') {
+            <p class="phase">Discuss</p>
+            <p class="waiting">
+              Talk it over with your neighbours. You will answer again, and the
+              results from both rounds are shown after that.
+            </p>
           } @else {
             <p class="waiting">Waiting for the teacher to open a question…</p>
           }
@@ -95,6 +121,10 @@ const SEND_BACKOFF_MS = 400;
       .hist .label { display: block; margin-bottom: 0.2rem; }
       .bar-line { display: flex; align-items: center; gap: 0.5rem; }
       .bar { height: 1.2rem; background: #2c7; border-radius: 3px; min-width: 2px; }
+      .bar.first { background: #9bd; height: 0.8rem; }
+      .sw { display: inline-block; width: 0.8rem; height: 0.8rem; background: #2c7;
+            border-radius: 2px; vertical-align: middle; }
+      .sw.first { background: #9bd; }
       .n { color: #555; font-size: 0.9rem; min-width: 1.2rem; }
       .total { color: #777; font-size: 0.9rem; margin-top: 0.8rem; }
     `,
@@ -133,22 +163,24 @@ export class StudentSessionComponent implements OnInit, OnDestroy {
     this.teardown?.();
   }
 
-  /** Answers for one choice, once the round is closed and the histogram is in. */
-  count(choiceId: number): number {
-    const hist = this.state()?.closed_round_histogram;
+  /**
+   * Answers for one choice, once the round is closed and the histogram is in.
+   * `hist` defaults to the closed round's own; pass the pre histogram to read
+   * the first round of a question asked twice.
+   */
+  count(choiceId: number, hist = this.state()?.closed_round_histogram): number {
     return hist ? hist[choiceId] || 0 : 0;
   }
 
-  histTotal(): number {
-    const hist = this.state()?.closed_round_histogram;
+  histTotal(hist = this.state()?.closed_round_histogram): number {
     if (!hist) return 0;
     return Object.values(hist).reduce((sum, n) => sum + n, 0);
   }
 
   /** Bar width as a percentage of the total answers, 0 when nobody answered. */
-  pct(choiceId: number): number {
-    const total = this.histTotal();
-    return total === 0 ? 0 : (this.count(choiceId) / total) * 100;
+  pct(choiceId: number, hist = this.state()?.closed_round_histogram): number {
+    const total = this.histTotal(hist);
+    return total === 0 ? 0 : (this.count(choiceId, hist) / total) * 100;
   }
 
   private resync(): void {
