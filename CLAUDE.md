@@ -176,6 +176,18 @@ quizbinf/
   the sessionmaker sets `expire_on_commit=False`, so the endpoint can still
   read the user's attributes without another query), and `events()` closes its
   session before it awaits *anything*, not merely before it streams.
+- **The connection pool and the write gate are not the same kind of thing,
+  and only one of them is SQLite's.** `POOL_SIZE` applies to every backend —
+  it used to be set inside the SQLite branch, so pointing `DATABASE_URL` at
+  Postgres fell back to SQLAlchemy's defaults of five plus ten overflow,
+  fifteen connections against forty request slots, which is exactly the
+  exhaustion failure the constant exists to prevent. A 200-student run against
+  Postgres peaks at **39 checked out**, so that migration would have broken on
+  its first busy lecture and looked like a new problem. The `writing()` gate is
+  the opposite: it exists because SQLite permits one writer at a time and
+  arbitrates badly between contenders, and `_serialise_writes` turns it off for
+  anything else. Leaving it on under Postgres would serialise every write in
+  this process and discard MVCC — the single largest reason to move there.
 - **The lecture-hall settings live in `app/db.py`,** and the defaults they
   replace are what made the app slow in front of a class. SQLite runs in
   **WAL** mode — without it a single writer blocks every reader, so one
@@ -183,6 +195,90 @@ quizbinf/
   connections here are file handles, and a pool smaller than the thread pool
   turns "busy" into "exhausted". `pool_timeout` is 10 s rather than 30, so a
   request that cannot be served fails while somebody is still watching.
+- **A transaction is a reader or a writer, and it must say which.** SQLite
+  allows one writer at a time, and both halves of this were learned the hard
+  way, one load test each.
+
+  A **writer** must open with `BEGIN IMMEDIATE`. Every write path here reads
+  first — find the user then insert one, find the answer then update it — and
+  SQLAlchemy opens that as a *deferred* transaction, a reader asking to become
+  a writer at the first INSERT. If another connection committed in between,
+  SQLite refuses **immediately**, without consulting `busy_timeout`, because
+  waiting there could deadlock. On the deployment that was 152 of 200
+  concurrent logins failing in about 19 ms each. It never reproduced locally
+  because the vulnerable window is the gap between the read and the write:
+  0.02 ms against a local disk, 6 ms against the mounted volume.
+
+  A **reader** must not. The first fix made *every* transaction immediate,
+  including the SELECT `current_user` does on the way into every request — so
+  the whole app serialised behind a lock only one request could hold. The next
+  load test: 350 answers shed with 503, the request cap saturated at 40 in
+  flight over a connection pool sitting almost idle at 41 of 50, and 41 of 200
+  students able to join at all. **A saturated cap over an idle pool is that
+  signature** — requests waiting for each other, not for the database.
+
+  So write paths declare themselves: `@write_path` on a service function, or
+  `with writing(db)` around a read-then-write sequence. `writing()` queues in
+  the process rather than inside SQLite, because `busy_timeout` is not a queue
+  — a blocked writer sleeps and retries, so with forty contenders the winner
+  is whoever wakes at the right moment, and the rest starve. A wait that does
+  time out is **503 with `Retry-After`**, not the 500 that `database is
+  locked` produced.
+
+  **A path that usually has nothing to write must not declare itself a
+  writer.** Two do this, and both comments say why. `record_participant` runs
+  on `/state` and on every SSE connect while the throttle means it writes on
+  almost none of them. `get_or_create_user` is every student's arrival, and
+  writing unconditionally — re-setting `role` to the value it already held —
+  cost a lecture: **185 of 200 logins refused** after the full
+  `WRITE_QUEUE_SECONDS`, 8 students in the session, and the connection pool
+  idle at 15 of 50. Nothing was contended except a lock taken for no reason.
+  Both now read first, outside the lock, and take it only when there is
+  genuinely something to write — re-reading inside the write transaction,
+  because the row may have appeared in between.
+
+  **On Postgres the gate does not serialise, so declaring a write path is no
+  longer enough on its own.** `writing()` still bounds the transaction, but
+  two calls to it run side by side, and every read-then-write in this app is a
+  check that another request can invalidate before the commit. The deployment
+  said so on its first lecture on Postgres: one `duplicate key ...
+  uq_participant_per_session` per student joining, each a race the join path
+  already tolerated. So a path that reads, decides and writes has to pick one:
+
+  - **Lock what the decision rests on.** `submit_answer` re-reads its round
+    `with_for_update(read=True)`, which `close_round` must wait for, so the
+    submission window still holds at the commit and not merely at the check.
+    `open_round` locks the session row, because two rounds open at once would
+    make `get_open_round` raise for everyone in the room.
+  - **Or expect to lose and recover.** `get_or_create_user` reads back the row
+    the winner wrote, rather than turning the first login of a lecture into a
+    500. `record_participant` inserts with `on_conflict_do_nothing`, since it
+    wants the row to exist and does not care who wrote it — and a refusal per
+    student is an ERROR line per student in the database log.
+
+  `tests/test_concurrent_writes.py` pins both halves: three tests drive the
+  losing side directly on SQLite, and one runs a class of threads against a
+  real Postgres when `QUIZBINF_TEST_POSTGRES_URL` is set. Against the code
+  before these fixes that last one fails with the same unique violations the
+  deployment logged.
+
+  Missing a write path is the failure this is all about, so `db.py` notices
+  one: an INSERT/UPDATE/DELETE outside `writing()` logs a warning in
+  production and **raises in the test suite** (`conftest.py` swaps the
+  handler), which makes every test in the repository also an assertion that
+  its write paths are declared. It logs rather than raises in production
+  because a missed path that logs is a rare 500 under load, while one that
+  raises is a feature that never works at all, discovered in front of a class.
+- **`GET /api/health` says which build is running** (`code`, a hash of the
+  app's own source) **and how deep the write queue is** (`write_queue`). Both
+  exist because of how long the two failures above took to tell apart. Without
+  the first, "the fix did not work" and "the fix was never deployed" are the
+  same reading; get the expected value for a checkout with `python -c "from
+  app.main import _code_fingerprint; print(_code_fingerprint())"`. Without the
+  second, writers queueing for each other looks exactly like the pool
+  exhaustion that came before it. `waiting` above zero under load is this
+  app's remaining hard limit — one writer at a time — and it is the one a
+  bigger machine does not raise.
 - **The app caps how many *database-backed* requests it lets in at once**
   (`REQUEST_SLOTS`), sized *below* the connection pool so exhausting the pool
   is not something that can happen — the queue forms at the door, where
@@ -206,9 +302,13 @@ quizbinf/
   lecture, holds no connection, so counting it would wedge the app inside one
   class) and `/api/health`, which has to answer *while* everything else is
   queueing.
-- **The cap is configuration, not a constant.** `REQUEST_SLOTS=0` in the
-  volume's config file switches it off; `REQUEST_SLOTS` and
-  `REQUEST_QUEUE_SECONDS` retune it. A limit whose only remedy is building and
+- **The cap is configuration, not a constant** — and so is the write queue's
+  timeout. `REQUEST_SLOTS=0` in the volume's config file switches the cap off;
+  `REQUEST_SLOTS` and `REQUEST_QUEUE_SECONDS` retune it, and
+  `WRITE_QUEUE_SECONDS` retunes how long a request waits for the right to
+  write. That last one is the app's hardest limit, since SQLite takes one
+  writer at a time, and it is the one most likely to bite in front of a
+  class. A limit whose only remedy is building and
   deploying a new image is one nobody can back out of with a class in the
   room, and this one has already had to be.
 - **A shed request must say what is holding the slots, not how many there are
@@ -218,6 +318,15 @@ quizbinf/
   be diagnosed from the list of requests it refused. It now logs the measured
   in-flight count, and any database request holding a slot longer than
   `SLOW_REQUEST_SECONDS` is logged with its path, duration and the pool stats.
+- **`GET /api/health` must not do I/O, and that includes the filesystem.** It
+  reported whether the data directory is writable, which costs a `mkdir`, a
+  `touch` and an `unlink` — three round trips to a network filesystem, on
+  every request, on the volume most likely to *be* what is stuck. Measured
+  against the deployment with one client and nothing else running,
+  `/api/health` reached 1.4 s while a static file on the same host never
+  passed 0.2 s. The answer is cached for `Settings.WRITABILITY_TTL`, with an
+  expiry rather than once at startup because a volume going read-only
+  mid-lecture is exactly what the reading is for.
 - **`GET /api/health` reports the connection pool and the journal mode.** The
   freeze is invisible from outside — requests stop being answered while health
   keeps saying ok, because it needs no database — so `checked_out` pinned at
@@ -513,6 +622,18 @@ URL so the QR code resolves. See the README.
   cd backend && python -m loadtest.lecture --base-url http://localhost:8000
   ```
 
+  **`loadtest/ingress.py` asks the narrower question**, and exists because the
+  people who need its answer run the platform rather than this app: it needs
+  no login, no database and no setup, touching only `GET /api/health` (an
+  `async def` over in-memory counters, exempt from the cap) and the SPA's HTML
+  off disk. A stall there happened before the application did any work. It
+  lists every slow request with its wall-clock time so the moments can be
+  lined up against an ingress log, and — having caught itself doing this on
+  its first run — it says so when the queue is its own: all the clients share
+  one interpreter lock, so the tell is slow requests that all *finish* within
+  a second of each other. `--clients 1` is the control, since a single client
+  cannot queue behind itself.
+
   Read it for *relative* signals — one endpoint far slower than the rest, a p99
   an order of magnitude past its p50, a 500, a pool pinned at its limit — and
   not for absolute capacity: the server and 150 Python clients share one
@@ -580,6 +701,76 @@ URL so the QR code resolves. See the README.
   on a new host, and the values are all obtainable again. If a
   restore-everything-including-credentials bundle is ever wanted, it needs to
   be a deliberate, separately-argued opt-in.
+
+  **The CA certificate the database URL verifies against travels with the
+  archive**, and it is the exception that proves the rule above: it is a
+  public document, not a credential, and it is *required* to start. Pointing
+  `DATABASE_URL` at another host with `sslmode=verify-full` is fail-closed by
+  design — libpq refuses the connection if the certificate does not verify —
+  which quietly turned a file on the volume into a startup dependency that
+  existed nowhere else. A restore onto a fresh volume would have produced an
+  app unable to open its database at all, discovered by somebody already in
+  the middle of a restore. `backup.tls_files` collects what the URL names, the
+  README says which absolute path each one has to go back to, and `sslcert`/
+  `sslkey` are deliberately excluded: the key is a credential, so the
+  redaction rule covers it.
+
+  **A damaged database is the case the backup exists for, so it must not be
+  the case the backup refuses.** `VACUUM INTO` reads every page, which makes
+  it the first thing to fail on a corrupt file — and the deployment did
+  corrupt, answering `database disk image is malformed` while its real lecture
+  data was still readable. The endpoint whose whole purpose is rescue produced
+  nothing. It now falls back to a **raw byte copy plus the `-wal`** (under WAL
+  the recent commits are in the log, and a copy without it loses them
+  silently), and the README in the archive says which of the two kinds it is
+  and gives the `sqlite3 .recover` incantation. `tests/
+  test_corrupt_database.py` damages a database on purpose and pins both.
+
+  **`GET /api/health/storage` reports `integrity`.** The corruption presented
+  as fast 500s on some logins and not others, with the *same* count of them
+  across two separate runs — which is a damaged page, not contention, and
+  three rounds of concurrency work were spent explaining it as contention. A
+  slow volume, an exhausted pool and a broken file are indistinguishable from
+  a latency column; nothing the app exposed could tell them apart. Take a
+  backup and check it (`PRAGMA integrity_check`) when you take it, not when
+  you need it.
+
+  **`python -m tools.copy_database` moves the data, and the backup uses the
+  same code.** One implementation serves both directions: off SQLite onto a
+  PostgreSQL server, and — when the deployment's database *is* PostgreSQL —
+  into the SQLite file that `GET /api/backup.zip` hands over. That endpoint
+  used to refuse anything but SQLite and advise `pg_dump`, which is advice
+  rather than a backup: the teacher has a browser and a session cookie, not a
+  shell on the database host, so moving to PostgreSQL would have quietly taken
+  away the one button that rescues this app's data. The archive keeps its
+  shape on every backend, and its README says which of three kinds of copy it
+  holds — vacuumed, raw, or copied from another database — because they are
+  read months later by somebody in a hurry and must not look alike. The copied
+  kind carries the ORM's tables and nothing else, so it says plainly that it
+  is not a substitute for a dump taken on the host.
+
+  **Ids travel unchanged, so PostgreSQL's sequences have to be moved past
+  them.** Answers reference round ids and rounds reference question ids;
+  renumbering would break those or require rewriting every one. A sequence
+  knows nothing about rows inserted with an explicit id, so without
+  `_reset_sequences` the very next INSERT reuses id 1 and fails — which here
+  is the first student to answer in the first lecture after the migration. The
+  copy is verified by counting both ends afterwards rather than trusting the
+  loop's own total: a copy that silently moved nothing looks like success from
+  the inside.
+
+  **A remote database with no TLS is warned about at startup.** The connection
+  to another host carries every student's name and answer, and the database
+  password with them. A warning and not a refusal, because the same URL shape
+  is right for the Postgres container beside the app in `docker-compose`,
+  where there is no network to cross — `sslmode=require` is what silences it.
+
+  **SQLite's locking is unreliable on a network filesystem, and WAL does not
+  work on one at all** — it needs real shared memory for the `-shm` file. If
+  the volume is network-backed, corruption is the expected outcome rather than
+  bad luck, and no amount of tuning inside the app substitutes for moving the
+  database. Establish what the storage class actually is before concluding
+  anything else about a corrupt file.
 
   The snapshot is written under a random filename rather than `quizbinf.db`:
   `VACUUM INTO` refuses to overwrite, so naming it after its source breaks the
@@ -749,7 +940,7 @@ alembic upgrade head
 | `GET /api/sessions/{code}/questions/{id}/comparison` | teacher | pre vs post counts |
 | `GET /api/sessions/{code}/questions/{id}/discussants?count=` | teacher | draw students at random from those who answered — **names only** |
 | `DELETE /api/sessions/{code}/questions/{id}/rounds` | teacher | reset a question — **discards its answers** so it can be run again |
-| `GET /api/backup.zip` | teacher | the whole volume: database, figures, config with secrets redacted |
+| `GET /api/backup.zip` | teacher | the whole volume: database, figures, config with secrets redacted — works on any backend |
 | `POST /api/images` | teacher | upload a figure; returns Markdown to paste |
 | `POST /api/markdown/preview` | teacher | render Markdown for the authoring preview |
 | `GET /api/sessions/{code}/state` | student | full state snapshot (resync) |

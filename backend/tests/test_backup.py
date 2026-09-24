@@ -9,6 +9,7 @@ which is checked by looking for every secret the app holds.
 import io
 import sqlite3
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 from app import backup
@@ -203,8 +204,8 @@ def test_the_backup_is_teacher_only(student_client, make_client):
 # --- deployments the app cannot snapshot -----------------------------------
 
 
-def test_a_postgres_deployment_is_told_to_use_its_own_tooling(monkeypatch):
-    """Rather than shipping a half-backup that looks like a whole one."""
+def test_a_non_sqlite_deployment_has_no_sqlite_path(monkeypatch):
+    """Nothing may guess a filename out of a URL that has none."""
     from app.config import get_settings
 
     settings = get_settings()
@@ -214,6 +215,117 @@ def test_a_postgres_deployment_is_told_to_use_its_own_tooling(monkeypatch):
     try:
         backup.sqlite_path(settings)
     except backup.NotSupported as e:
-        assert "pg_dump" in str(e)
+        assert "postgresql+psycopg" in str(e)
     else:
-        raise AssertionError("a Postgres deployment must be refused, not guessed at")
+        raise AssertionError("a Postgres deployment has no SQLite file to point at")
+
+
+def test_a_backup_never_describes_itself_as_more_than_it_is():
+    """The concern the old refusal was protecting, kept without the refusal.
+
+    This endpoint used to decline on anything but SQLite and tell the teacher
+    to run `pg_dump` — advice, not a backup: they have a browser and a session
+    cookie, not a shell on the database host. Moving to PostgreSQL would have
+    quietly removed the one button that rescues this app's data.
+
+    It now renders any database into a portable SQLite file. What must not
+    happen is the original worry: an archive that *looks* like a whole-server
+    dump. The three kinds of copy have to be distinguishable inside the
+    archive, because they are read months later by somebody in a hurry.
+    """
+    vacuumed = backup._readme(
+        datetime.now(timezone.utc), 1024, 0, False, backup.VACUUMED
+    )
+    raw = backup._readme(datetime.now(timezone.utc), 1024, 0, False, backup.RAW)
+    copied = backup._readme(datetime.now(timezone.utc), 1024, 0, False, backup.COPIED)
+
+    assert "VACUUM INTO" in vacuumed
+    assert "RAW COPY" not in vacuumed
+
+    assert "RAW COPY" in raw
+    assert ".recover" in raw
+
+    assert "not SQLite" in copied
+    assert "NOT a substitute" in copied, "it must not read as a whole-server dump"
+    assert "pg_dump" in copied, "and it must name the tool that is one"
+
+
+# --- the certificate the database connection needs -------------------------
+
+
+def test_the_ca_certificate_named_by_the_database_url_is_found(tmp_path):
+    """`sslmode=verify-full` is fail-closed, which makes this file a startup
+    dependency: without it libpq refuses the connection and the app cannot
+    open the database at all. It lived only on the volume and was in no
+    backup, so restoring onto a fresh volume produced a deployment that would
+    not start."""
+    from app.config import Settings
+
+    ca = tmp_path / "quizbinf-pg-ca.crt"
+    ca.write_text("-----BEGIN CERTIFICATE-----\nnot really one\n")
+
+    settings = Settings(
+        data_dir=str(tmp_path),
+        database_url=(
+            "postgresql+psycopg://u:p@heisenberg.scilifelab.se:5432/quizbinf"
+            f"?sslmode=verify-full&sslrootcert={ca}"
+        ),
+    )
+
+    assert backup.tls_files(settings) == [ca]
+
+
+def test_a_private_key_never_travels(tmp_path):
+    """Only the public half. A CA certificate is published so that clients can
+    verify against it; a client key is a credential, and the rule that keeps
+    the Canvas token out of this archive keeps a key out of it too."""
+    from app.config import Settings
+
+    ca = tmp_path / "ca.crt"
+    ca.write_text("ca")
+    cert = tmp_path / "client.crt"
+    cert.write_text("cert")
+    key = tmp_path / "client.key"
+    key.write_text("PRIVATE KEY")
+
+    settings = Settings(
+        data_dir=str(tmp_path),
+        database_url=(
+            "postgresql+psycopg://u:p@db:5432/quizbinf?sslmode=verify-full"
+            f"&sslrootcert={ca}&sslcert={cert}&sslkey={key}"
+        ),
+    )
+
+    assert backup.tls_files(settings) == [ca]
+
+
+def test_a_sqlite_deployment_carries_no_certificate(tmp_path):
+    """Nothing crosses a network, so there is nothing to verify."""
+    from app.config import Settings
+
+    settings = Settings(data_dir=str(tmp_path))
+    assert backup.tls_files(settings) == []
+
+
+def test_the_certificate_is_in_the_archive_and_the_readme_says_where_it_goes(
+    teacher_client, tmp_path, monkeypatch
+):
+    """The path matters as much as the file: DATABASE_URL names it absolutely,
+    so a restore that puts it somewhere else still cannot connect."""
+    ca = tmp_path / "quizbinf-pg-ca.crt"
+    ca.write_text("-----BEGIN CERTIFICATE-----\nthe-ca-bytes\n")
+    monkeypatch.setattr(backup, "tls_files", lambda settings: [ca])
+
+    with _archive(teacher_client) as bundle:
+        assert "quizbinf-pg-ca.crt" in bundle.namelist()
+        assert b"the-ca-bytes" in bundle.read("quizbinf-pg-ca.crt")
+        readme = bundle.read("README.txt").decode()
+
+    assert str(ca) in readme, "the README must name the path it has to go back to"
+    assert "not a secret" in readme
+
+
+def test_the_readme_stays_quiet_when_there_is_no_certificate():
+    """No stray prose about certificates on a deployment that has none."""
+    readme = backup._readme(datetime.now(timezone.utc), 1024, 0, False, backup.VACUUMED)
+    assert "certificate" not in readme.lower()

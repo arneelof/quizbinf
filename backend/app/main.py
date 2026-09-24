@@ -14,8 +14,9 @@ from starlette.responses import FileResponse, JSONResponse
 
 from .auth import RENEW_FLAG, passwords_match, set_session_cookie
 from .config import VOLUME_ENV_FILE, get_settings
-from .db import Base, engine, journal_mode, pool_stats
+from .db import Base, WriteQueueTimeout, engine, journal_mode, pool_stats, write_queue_stats
 from .diagnostics import dump_threads, storage_report
+from .events import broadcaster
 from .routers import auth, backup, images, markdown, quizzes, reports, roster, sessions
 
 log = logging.getLogger("quizbinf")
@@ -57,6 +58,12 @@ def log_startup_summary() -> None:
     log.info(
         "database: %s", url if url.startswith("sqlite") else url.split("://", 1)[0] + "://…"
     )
+    if _database_crosses_a_network_unencrypted(url):
+        log.warning(
+            "DATABASE_URL reaches a remote host with no TLS: every student name, "
+            "answer and the database password itself cross the network in clear. "
+            "Add ?sslmode=require (or verify-full, with a CA) to the URL."
+        )
 
     log.info("environment=%s mock_login=%s", s.environment, s.mock_login)
     if s.mock_login_allowed:
@@ -119,7 +126,7 @@ if settings.environment != "production":
     )
 
 #: How many *database-backed* requests may be in the app at once. Below the
-#: pool they draw from (`db.SQLITE_POOL_SIZE`), so running out of connections
+#: pool they draw from (`db.POOL_SIZE`), so running out of connections
 #: is not something that can happen: the queue forms here instead, where
 #: waiting is all it does. Roughly the size of the thread pool that runs
 #: synchronous endpoints, since that is how much work can actually proceed.
@@ -288,9 +295,82 @@ app.include_router(roster.router)
 app.include_router(sessions.router)
 
 
+@app.exception_handler(WriteQueueTimeout)
+async def write_queue_timeout(request: Request, exc: WriteQueueTimeout) -> JSONResponse:
+    """A request waited its turn to write and never got one.
+
+    The same answer as the concurrency cap gives, for the same reason and in
+    the same words: 503 with `Retry-After` says "ask again", and the student
+    view acts on it by re-sending the answer with a jittered backoff. The
+    alternative is what this replaced — SQLite exhausting its busy timeout and
+    raising `database is locked`, which reaches the student as a 500 telling
+    them the server is broken and to stop trying.
+    """
+    log.warning("write queue full: %s", request.url.path)
+    return JSONResponse(
+        {"detail": "The server is busy. Please try again."},
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        headers={"Retry-After": "1"},
+    )
+
+
+def _database_crosses_a_network_unencrypted(url: str) -> bool:
+    """A remote database, reached without TLS.
+
+    Worth a warning rather than a refusal: the same URL shape is right for a
+    Postgres container beside the app in `docker-compose`, where there is no
+    network to cross and no certificate to present, and refusing there would
+    break local development for a risk that does not exist.
+
+    What it is not fine for is the deployment this app is moving to — an
+    application on SciLifeLab Serve talking to a database on another host.
+    That connection carries every student's name and answer, and the database
+    password with them, so unencrypted it is both a privacy problem and a
+    credential leak. SQLite never crosses a network; localhost does not
+    either.
+    """
+    if url.startswith("sqlite"):
+        return False
+    if "sslmode=" in url or "ssl=" in url:
+        return False
+    after_scheme = url.split("://", 1)[-1]
+    host = after_scheme.split("@")[-1].split("/")[0].split("?")[0]
+    hostname = host.split(":")[0]
+    # A unix socket (host= in the query) or a loopback address stays on the
+    # machine, so there is nothing to encrypt.
+    return hostname not in ("", "localhost", "127.0.0.1", "::1", "db")
+
+
 # Identifies this process across requests. Two different values coming back
 # from the same URL mean more than one instance is serving it.
 INSTANCE_ID = secrets.token_hex(4)
+
+
+def _code_fingerprint() -> str:
+    """A hash of the application's own source, computed once at startup.
+
+    It answers one question that cost real time to answer any other way: *is
+    the code I just merged the code that is running?* Serve pulls an image
+    tag, and nothing the app returned said which build it was — so a load test
+    against a deployment that had not been redeployed would look exactly like
+    a fix that did not work.
+
+    Source rather than a build argument, because the image is built by a
+    workflow this app does not control, and a fingerprint that needs the
+    Dockerfile to cooperate is one that silently reports "unknown" the first
+    time somebody builds it another way. Run
+    `python -c "from app.main import _code_fingerprint; print(_code_fingerprint())"`
+    on a checkout to get the value a deployment of it should report.
+    """
+    root = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*.py")):
+        digest.update(path.relative_to(root).as_posix().encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:8]
+
+
+CODE_FINGERPRINT = _code_fingerprint()
 
 
 @app.get("/api/health")
@@ -323,12 +403,27 @@ async def health() -> dict:
         "storage": "persistent" if settings._writable_data_dir() else "ephemeral",
         "instance": INSTANCE_ID,
         "secret": fingerprint[:8],
+        # Which build this is. See `_code_fingerprint`: without it, "the fix
+        # did not work" and "the fix was never deployed" look identical.
+        "code": CODE_FINGERPRINT,
         # The freeze this app has already suffered once is invisible from
         # outside: requests stop being answered while this endpoint keeps
         # saying ok, because it needs no database. `checked_out` climbing to
         # `size` and staying there is that failure, visible from a phone.
         "db_pool": pool_stats(),
+        # SQLite takes one writer at a time, so this is the app's remaining
+        # hard limit and the one a bigger machine does not raise. `waiting`
+        # above zero under load is writers queueing for each other — which
+        # from outside looks identical to the *previous* failure, a saturated
+        # request cap over an idle pool, and had to be told apart by deploying
+        # a change and looking again.
+        "write_queue": write_queue_stats(),
         "journal_mode": journal_mode(),
+        # Streams this process is holding. Invisible everywhere else: exempt
+        # from the cap, holding no connection, absent from the request log
+        # once established. High long after a lecture ended means the clients
+        # went away and the disconnects never arrived.
+        "sse_streams": broadcaster.total_open(),
     }
 
 

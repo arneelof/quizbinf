@@ -13,6 +13,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from .db import insert_ignoring_conflict, write_path, writing
 from .models import (
     Answer,
     Choice,
@@ -34,6 +35,7 @@ class RuleViolation(Exception):
     """A domain rule was violated; maps to HTTP 409 at the API layer."""
 
 
+@write_path
 def open_round(db: Session, session: QuizSession, question: Question, phase: Phase) -> Round:
     """Open a round for `question` in `session`.
 
@@ -44,6 +46,14 @@ def open_round(db: Session, session: QuizSession, question: Question, phase: Pha
     """
     if question.quiz_id != session.quiz_id:
         raise RuleViolation("Question does not belong to this session's quiz")
+    # Lock the session for the length of this decision. Without the write gate
+    # two clicks a moment apart — a teacher's double tap, or the projected view
+    # and the phone remote — could both read "nothing open" and open a round
+    # each. Two open rounds is worse than a refused click: `get_open_round`
+    # expects at most one and would raise for everyone in the session, mid
+    # question. Postgres holds the lock until this transaction ends; SQLite
+    # ignores it and has the gate.
+    db.execute(select(QuizSession.id).where(QuizSession.id == session.id).with_for_update())
     if get_open_round(db, session) is not None:
         raise RuleViolation("Another round is already open in this session")
     existing = db.scalar(
@@ -74,6 +84,7 @@ def open_round(db: Session, session: QuizSession, question: Question, phase: Pha
     return round_
 
 
+@write_path
 def close_round(db: Session, round_: Round) -> Round:
     if not round_.is_open:
         raise RuleViolation("Round is already closed")
@@ -114,25 +125,52 @@ def get_last_closed_round(db: Session, session: QuizSession) -> Round | None:
     )
 
 
+@write_path
 def submit_answer(db: Session, round_: Round, user: User, choice: Choice) -> Answer:
     """Record `user`'s answer; one answer per user per round, last write wins
-    while the round is open."""
-    if not round_.is_open:
-        raise RuleViolation("This round is closed")
+    while the round is open.
+
+    On Postgres this runs alongside every other answer in the room, so the two
+    things the write gate used to guarantee are arranged here instead:
+
+    * **The round cannot close underneath it.** The round is re-read holding a
+      share lock on its row, which `close_round` must update and therefore
+      waits for; an answer arriving after the close has committed re-reads it
+      as closed and is refused. The submission window is the attendance guard,
+      so it has to hold to the commit and not merely to the check. The re-read
+      matters on SQLite too: the caller loaded `round_` before this queued for
+      the gate, and it may have closed in between.
+    * **The same student may arrive twice at once** — a phone re-sending after
+      a 502 while the first attempt is still in flight. Both find no row and
+      both insert; the unique constraint refuses one, and that one runs again
+      and updates the row the winner wrote.
+    """
     if choice.question_id != round_.question_id:
         raise RuleViolation("Choice does not belong to the round's question")
-    answer = db.scalar(
-        select(Answer).where(Answer.round_id == round_.id, Answer.user_id == user.id)
-    )
-    if answer is None:
-        answer = Answer(round_id=round_.id, user_id=user.id, choice_id=choice.id)
-        db.add(answer)
-    else:
-        answer.choice_id = choice.id
-        answer.submitted_at = utcnow()
-    db.commit()
-    db.refresh(answer)
-    return answer
+    for attempt in range(2):
+        db.refresh(round_, with_for_update={"read": True})
+        if not round_.is_open:
+            raise RuleViolation("This round is closed")
+        answer = db.scalar(
+            select(Answer).where(Answer.round_id == round_.id, Answer.user_id == user.id)
+        )
+        if answer is None:
+            answer = Answer(round_id=round_.id, user_id=user.id, choice_id=choice.id)
+            db.add(answer)
+        else:
+            answer.choice_id = choice.id
+            answer.submitted_at = utcnow()
+        try:
+            db.commit()
+        except IntegrityError:
+            # Lost to the student's own other request. Start again: the second
+            # pass finds the row and updates it.
+            db.rollback()
+            if attempt:
+                raise
+            continue
+        db.refresh(answer)
+        return answer
 
 
 #: How stale `last_seen_at` may get before it is worth a write.
@@ -149,35 +187,68 @@ def submit_answer(db: Session, round_: Round, user: User, choice: Choice) -> Ans
 PARTICIPANT_TOUCH_SECONDS = 60
 
 
+def _participant_is_current(participant: SessionParticipant | None) -> bool:
+    if participant is None:
+        return False
+    seen = participant.last_seen_at
+    if seen.tzinfo is None:  # SQLite hands back naive datetimes
+        seen = seen.replace(tzinfo=timezone.utc)
+    return (utcnow() - seen).total_seconds() < PARTICIPANT_TOUCH_SECONDS
+
+
 def record_participant(db: Session, session: QuizSession, user: User) -> None:
-    """Note that `user` has the session open. Idempotent; safe to call often."""
-    participant = db.scalar(
-        select(SessionParticipant).where(
-            SessionParticipant.session_id == session.id,
-            SessionParticipant.user_id == user.id,
-        )
+    """Note that `user` has the session open. Idempotent; safe to call often.
+
+    Deliberately *not* a `@write_path`, and this is the one place in the app
+    where that distinction is worth spelling out. It is called from `/state`
+    and from the SSE connect, so it runs on every request a student makes,
+    while the throttle above means it actually writes on almost none of them.
+    Declaring the whole function a writer would take the process-wide write
+    lock for every one of those reads and serialise the entire application
+    behind them — which is precisely the failure the split in `db.py` exists
+    to avoid, reintroduced from the busiest path in the app.
+
+    So the read happens first, concurrently, outside the lock; only the rare
+    case that has something to write asks for it, and re-reads inside the
+    write transaction because the row may have appeared in between.
+    """
+    look_up = select(SessionParticipant).where(
+        SessionParticipant.session_id == session.id,
+        SessionParticipant.user_id == user.id,
     )
-    if participant is not None:
-        seen = participant.last_seen_at
-        if seen.tzinfo is None:  # SQLite hands back naive datetimes
-            seen = seen.replace(tzinfo=timezone.utc)
-        if (utcnow() - seen).total_seconds() >= PARTICIPANT_TOUCH_SECONDS:
-            participant.last_seen_at = utcnow()
-        # Commit either way: the SELECT above opened a transaction, and a
-        # Session holding one keeps a pooled connection checked out. Skipping
-        # the write must not turn into holding a connection instead.
+    participant = db.scalar(look_up)
+    if _participant_is_current(participant):
+        # End the transaction the SELECT opened: a Session holding one keeps a
+        # pooled connection checked out, and skipping the write must not turn
+        # into holding a connection instead.
         db.commit()
         return
 
-    db.add(SessionParticipant(session_id=session.id, user_id=user.id))
-    try:
-        db.commit()
-    except IntegrityError:
+    db.commit()  # a deferred transaction cannot be promoted; close it first
+    with writing(db):
+        participant = db.scalar(look_up)
+        if participant is not None:
+            if not _participant_is_current(participant):
+                participant.last_seen_at = utcnow()
+            db.commit()
+            return
         # A student's first load fetches the state and opens the SSE stream at
-        # almost the same moment, so both requests can find no row and try to
-        # insert one. Losing that race is not an error — the row exists — but
-        # letting it raise would 500 exactly when a student joins.
-        db.rollback()
+        # almost the same moment, so two requests reach this line together and
+        # one of them loses. Losing is not an error — the row exists, which is
+        # all this function wanted — so the insert is written to do nothing on
+        # conflict rather than to be refused and rolled back. Under the write
+        # gate the race could not happen inside one process; on Postgres,
+        # where the gate is off, the deployment logged one refusal per student
+        # joining a lecture.
+        insert_ignoring_conflict(
+            db,
+            SessionParticipant,
+            session_id=session.id,
+            user_id=user.id,
+            joined_at=utcnow(),
+            last_seen_at=utcnow(),
+        )
+        db.commit()
 
 
 #: Mirrors `routers.auth.LOADTEST_PREFIX`. Defined here rather than imported
@@ -186,6 +257,7 @@ def record_participant(db: Session, session: QuizSession, user: User) -> None:
 LOADTEST_PREFIX = "loadtest-"
 
 
+@write_path
 def delete_loadtest_session(db: Session, session: QuizSession) -> dict:
     """Delete a rehearsal, its answers, and the throwaway students it created.
 
@@ -523,6 +595,41 @@ def session_answering(
     return users, answered, len(rounds)
 
 
+def canvas_match_summary(db: Session, session: QuizSession, course_id: int) -> dict:
+    """Whether the Canvas file for this lecture can actually be imported.
+
+    A row with no Canvas id is skipped by Canvas silently, and the file still
+    looks right: 114 rows, every mark filled in. That is how a lecture's
+    attendance went missing — the teacher imported a correct-looking file and
+    found a handful of marks in the gradebook, with nothing anywhere saying
+    which rows Canvas had thrown away.
+
+    So the same counting the export does is available before the download, and
+    the unmatched are named. `synced_at` is the roster's age, the other half of
+    the question: a roster from before the term filled up matches the students
+    who registered early and nobody else.
+    """
+    users, _taken, _chances = session_answering(db, session)
+    roster = {
+        entry.username: entry
+        for entry in db.scalars(
+            select(RosterEntry).where(RosterEntry.course_id == course_id)
+        )
+    }
+    unmatched = sorted(u.username for u in users.values() if u.username not in roster)
+    synced_at = db.scalar(
+        select(func.max(RosterEntry.synced_at)).where(RosterEntry.course_id == course_id)
+    )
+    return {
+        "course_id": course_id,
+        "students": len(users),
+        "matched": len(users) - len(unmatched),
+        "unmatched": unmatched,
+        "roster_students": len(roster),
+        "synced_at": synced_at,
+    }
+
+
 def canvas_participation(
     db: Session,
     teacher: User,
@@ -668,6 +775,7 @@ def session_canvas_participation(
     }
 
 
+@write_path
 def sync_roster(db: Session, teacher: User, course_id: int, students: list[dict]) -> dict:
     """Replace the stored roster for a course with what Canvas just reported.
 
@@ -792,6 +900,7 @@ def device_claim_conflict(
     return None if claim.username == username else claim.username
 
 
+@write_path
 def record_device_claim(db: Session, device_id: str, username: str) -> None:
     """Bind a device to an identity, refreshing the window on each sign-in."""
     if not device_id:
@@ -863,6 +972,7 @@ def roster_courses(db: Session, teacher: User) -> list[dict]:
     ]
 
 
+@write_path
 def update_question(
     db: Session,
     question: Question,
@@ -938,6 +1048,7 @@ def update_question(
     return question
 
 
+@write_path
 def reorder_questions(db: Session, quiz: Quiz, question_ids: list[int]) -> list[Question]:
     """Put a quiz's questions in the given order.
 
@@ -964,6 +1075,7 @@ def reorder_questions(db: Session, quiz: Quiz, question_ids: list[int]) -> list[
     return list(quiz.questions)
 
 
+@write_path
 def delete_question(db: Session, question: Question) -> None:
     """Remove a question, unless doing so would destroy recorded answers.
 
@@ -1061,6 +1173,7 @@ def reel_names(
     return names
 
 
+@write_path
 def reset_question(db: Session, session: QuizSession, question: Question) -> int:
     """Discard both rounds of `question` so it can be asked again.
 

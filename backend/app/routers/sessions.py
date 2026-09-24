@@ -15,7 +15,7 @@ from starlette.concurrency import run_in_threadpool
 from .. import service
 from ..auth import current_teacher, current_user
 from ..config import Settings, get_settings
-from ..db import SessionLocal, get_db
+from ..db import SessionLocal, get_db, writing
 from ..events import broadcaster
 from ..models import Answer, Choice, Phase, Question, QuestionMode, Quiz, QuizSession, User
 from ..public_base import public_base_url
@@ -97,16 +97,35 @@ def _state(db: Session, session: QuizSession, user: User | None) -> SessionState
     )
 
 
-async def _broadcast_state(session_code: str) -> None:
-    """Publish the (user-independent) session state to all SSE subscribers."""
+def _state_snapshot(session_code: str) -> dict | None:
+    """Read the session state with its own short-lived database session."""
     db = SessionLocal()
     try:
         session = db.scalar(select(QuizSession).where(QuizSession.code == session_code))
-        if session is not None:
-            state = _state(db, session, user=None)
-            await broadcaster.publish(session_code, state.model_dump(mode="json"))
+        if session is None:
+            return None
+        return _state(db, session, user=None).model_dump(mode="json")
     finally:
         db.close()
+
+
+async def _broadcast_state(session_code: str) -> None:
+    """Publish the (user-independent) session state to all SSE subscribers.
+
+    The read happens in a thread and only the publish happens here. It used to
+    query directly, and that was a deadlock: this runs from `async def`
+    endpoints, so a synchronous query executes *on the event loop*, and since
+    every SQLite transaction now opens with `BEGIN IMMEDIATE` it may have to
+    wait for the write lock. Whoever holds that lock is a worker thread that
+    needs the event loop to finish its response — so neither can proceed, and
+    the app unsticks only when `busy_timeout` expires fifteen seconds later.
+
+    That is almost certainly what a 728-second request looked like from the
+    inside. Nothing synchronous may touch the database from a coroutine here.
+    """
+    payload = await run_in_threadpool(_state_snapshot, session_code)
+    if payload is not None:
+        await broadcaster.publish(session_code, payload)
 
 
 # --- teacher endpoints -----------------------------------------------------
@@ -130,10 +149,11 @@ def create_session(
     quiz = db.get(Quiz, quiz_id)
     if quiz is None or quiz.owner_id != teacher.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Quiz not found")
-    session = QuizSession(quiz_id=quiz.id, is_loadtest=loadtest)
-    db.add(session)
-    db.commit()
-    db.refresh(session)
+    with writing(db):
+        session = QuizSession(quiz_id=quiz.id, is_loadtest=loadtest)
+        db.add(session)
+        db.commit()
+        db.refresh(session)
     return session
 
 
@@ -226,6 +246,21 @@ async def open_round(
     db: Session = Depends(get_db),
     teacher: User = Depends(current_teacher),
 ):
+    """Open a bout. The database work runs in a thread, never on the loop.
+
+    See `_broadcast_state` for what happens when it does not: this endpoint
+    takes SQLite's write lock and then awaits a broadcast that wants the same
+    lock, while the thread holding it waits for the event loop this coroutine
+    is sitting on.
+    """
+    round_ = await run_in_threadpool(_open_round_sync, db, code, body, teacher)
+    await _broadcast_state(code)
+    return round_
+
+
+def _open_round_sync(
+    db: Session, code: str, body: OpenRoundIn, teacher: User
+) -> RoundOut:
     session = _session_by_code(db, code)
     if session.quiz.owner_id != teacher.id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your session")
@@ -236,8 +271,15 @@ async def open_round(
         round_ = service.open_round(db, session, question, body.phase)
     except service.RuleViolation as e:
         raise HTTPException(status.HTTP_409_CONFLICT, str(e))
-    await _broadcast_state(session.code)
-    return round_
+    # Serialised here rather than returned as an ORM object: FastAPI would
+    # otherwise read its attributes on the event loop, which can lazy-load.
+    out = RoundOut.model_validate(round_)
+    # End the transaction before returning. The caller broadcasts next, which
+    # needs a connection of its own, and a request still holding SQLite's
+    # write lock would be waiting for itself — the rule `current_user`
+    # already follows: never hold a transaction across a boundary.
+    db.commit()
+    return out
 
 
 @router.post("/{code}/rounds/{round_id}/close", response_model=RoundOut)
@@ -247,6 +289,15 @@ async def close_round(
     db: Session = Depends(get_db),
     teacher: User = Depends(current_teacher),
 ):
+    """Halt a bout — in a thread, for the reason given on `open_round`."""
+    round_ = await run_in_threadpool(_close_round_sync, db, code, round_id, teacher)
+    await _broadcast_state(code)
+    return round_
+
+
+def _close_round_sync(
+    db: Session, code: str, round_id: int, teacher: User
+) -> RoundOut:
     session = _session_by_code(db, code)
     if session.quiz.owner_id != teacher.id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your session")
@@ -257,8 +308,13 @@ async def close_round(
         round_ = service.close_round(db, round_)
     except service.RuleViolation as e:
         raise HTTPException(status.HTTP_409_CONFLICT, str(e))
-    await _broadcast_state(session.code)
-    return round_
+    out = RoundOut.model_validate(round_)
+    # End the transaction before returning. The caller broadcasts next, which
+    # needs a connection of its own, and a request still holding SQLite's
+    # write lock would be waiting for itself — the rule `current_user`
+    # already follows: never hold a transaction across a boundary.
+    db.commit()
+    return out
 
 
 @router.delete("/{code}/questions/{question_id}/rounds")
@@ -274,13 +330,24 @@ async def reset_question(
     question in this session. Offered because a question can otherwise be
     asked only once per session, which makes rehearsing awkward.
     """
+    removed = await run_in_threadpool(_reset_question_sync, db, code, question_id, teacher)
+    await _broadcast_state(code)
+    return {"removed_rounds": removed}
+
+
+def _reset_question_sync(db: Session, code: str, question_id: int, teacher: User) -> int:
+    """In a thread, for the reason given on `open_round`."""
     session = _owned_session(db, code, teacher)
     question = db.get(Question, question_id)
     if question is None or question.quiz_id != session.quiz_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Question not found")
     removed = service.reset_question(db, session, question)
-    await _broadcast_state(session.code)
-    return {"removed_rounds": removed}
+    # End the transaction before returning. The caller broadcasts next, which
+    # needs a connection of its own, and a request still holding SQLite's
+    # write lock would be waiting for itself — the rule `current_user`
+    # already follows: never hold a transaction across a boundary.
+    db.commit()
+    return removed
 
 
 @router.get("/{code}/rounds/{round_id}/histogram", response_model=HistogramOut)
@@ -346,6 +413,26 @@ def participation(
         questions=session.quiz.questions,
         rows=service.participation_report(db, session),
     )
+
+
+@router.get("/{code}/canvas-readiness")
+def session_canvas_readiness(
+    code: str,
+    course_id: int | None = None,
+    db: Session = Depends(get_db),
+    teacher: User = Depends(current_teacher),
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    """What the Canvas file below will and will not carry.
+
+    Read before the download rather than discovered after the import: Canvas
+    skips a row with no id of its own and says so nowhere the teacher looks.
+
+    Names usernames, so teacher-only and the session's own owner, like every
+    other view on this page.
+    """
+    session = _owned_session(db, code, teacher)
+    return service.canvas_match_summary(db, session, course_id or settings.canvas_course_id)
 
 
 @router.get("/{code}/canvas-participation.csv", include_in_schema=False)

@@ -13,19 +13,28 @@ What goes in, and why:
 * **The uploaded figures.** Questions reference them by path; a database
   restored without them renders questions with broken images.
 * **The configuration**, with secrets removed — see below.
+* **The CA certificate the database URL verifies against**, if there is one.
+  Under `sslmode=verify-full` the app cannot open a connection without it, so
+  leaving it out turns a restore into a deployment that will not start.
 
 What is deliberately left out: nothing else on the volume is anything but
 derived state.
 """
 
+import logging
 import re
 import secrets
+import shutil
 import sqlite3
 import zipfile
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import parse_qsl, urlsplit
 
 from .config import Settings
+
+log = logging.getLogger("quizbinf.backup")
 
 #: Any configuration key whose *value* is a credential. Matched by pattern
 #: rather than listed, so a secret added later is redacted by default instead
@@ -78,27 +87,161 @@ def sqlite_path(settings: Settings) -> Path:
     """The SQLite file behind this deployment, or raise for anything else."""
     url = settings.resolved_database_url
     if not url.startswith("sqlite"):
-        raise NotSupported(
-            "This deployment does not use SQLite, so the app cannot take its "
-            "own snapshot. Use the database server's own tooling (pg_dump) "
-            "instead."
-        )
+        raise NotSupported(f"this deployment's database is {url.split('://')[0]}")
     return Path(url.split("sqlite:///", 1)[-1])
 
 
-def snapshot_database(settings: Settings, destination: Path) -> None:
-    """Copy the database consistently, without blocking the lecture.
+#: Files the database URL points at that the app cannot start without, and
+#: that are safe to publish. A CA certificate is a public document — it exists
+#: precisely so that clients can be handed it — and `sslcrl` is the same kind
+#: of thing. `sslcert`/`sslkey` are deliberately not here: the key is a
+#: credential, and the rule that keeps the Canvas token out of this archive
+#: keeps a private key out of it too.
+TLS_KEYS = ("sslrootcert", "sslcrl")
 
-    `VACUUM INTO` reads through a normal transaction, so a session running at
-    the same time carries on. Copying the file byte-for-byte instead can catch
-    it mid-write and produce a snapshot that will not open.
+
+def tls_files(settings: Settings) -> list[Path]:
+    """The certificate material the database URL names, if it is on disk.
+
+    `sslmode=verify-full` is fail-closed by design: libpq checks the server's
+    certificate against `sslrootcert` and refuses to connect if it does not
+    verify. That is the right setting for a database on another host, and it
+    quietly made a file on the volume into a startup dependency — one that
+    lived nowhere else and was in no backup. Restoring the database onto a
+    fresh volume would have produced an app that could not open a connection
+    at all, discovered at the moment somebody was restoring from a backup.
+
+    So it travels with the archive. It is a certificate, not a secret; what
+    would be a secret is a client key, which is why only the public half is
+    collected here.
     """
-    source = sqlite_path(settings)
+    query = urlsplit(settings.resolved_database_url).query
+    found: list[Path] = []
+    for key, value in parse_qsl(query):
+        if key not in TLS_KEYS or not value:
+            continue
+        path = Path(value)
+        if path.is_file() and path.resolve() not in {p.resolve() for p in found}:
+            found.append(path)
+    return found
+
+
+def snapshot_other_database(settings: Settings, destination: Path) -> None:
+    """Copy a non-SQLite database into a SQLite file.
+
+    The endpoint used to refuse outright here and tell the teacher to run
+    `pg_dump`, which is advice and not a backup: they have a browser and a
+    session cookie, not a shell on the database host. Moving to PostgreSQL
+    would have quietly taken away the one button that rescues this app's data.
+
+    So the archive keeps its shape whatever the deployment runs on — the same
+    `quizbinf.db`, openable by anyone, checkable with `PRAGMA
+    integrity_check`, restorable onto either backend. It needs no `pg_dump`
+    binary in the image, and therefore cannot fail because that binary is a
+    version behind the server it is pointed at.
+
+    It carries the rows of the tables this app defines and nothing else, so it
+    is not a replacement for a proper dump taken on the database host. It is
+    the portable copy of the only data that cannot be recreated, which is what
+    this endpoint was always for.
+    """
+    from .dbcopy import copy_database
+
+    copy_database(
+        settings.resolved_database_url, f"sqlite:///{destination}", force=False
+    )
+
+
+#: What `snapshot_database` produced, because the README has to say which and
+#: the three are not interchangeable to somebody restoring one.
+VACUUMED = "vacuumed"   #: a consistent SQLite snapshot
+RAW = "raw"             #: a byte copy of a SQLite file that would not vacuum
+COPIED = "copied"       #: another database's rows, rendered into SQLite
+
+
+def snapshot_database(settings: Settings, destination: Path) -> str:
+    """Copy the database, and report which kind of copy it managed.
+
+    `VACUUM INTO` is the way to do this while a lecture is running: it reads
+    through a normal transaction, so a session carries on around it, where
+    copying the file byte-for-byte can catch it mid-write and produce a
+    snapshot that will not open.
+
+    But `VACUUM INTO` reads *every page*, so it is also the first thing to
+    fail when the database is damaged — and a backup that refuses precisely
+    when the database is broken is no backup at all. That is not hypothetical:
+    this deployment returned `database disk image is malformed` from a live
+    file whose real lecture data was still readable, and the endpoint that
+    exists to rescue it declined to produce anything.
+
+    So a failed VACUUM falls back to copying the bytes. What that yields is
+    worse in every way except the one that matters: it may be torn, it may
+    hold a half-finished transaction, and it is what `sqlite3 .recover` needs
+    in order to salvage rows from a file that will no longer open. The write-
+    ahead log goes with it, since under WAL the recent commits are in there
+    rather than in the database file, and a copy without it silently loses
+    them.
+
+    The caller is told which kind it got, because the difference decides what
+    the archive can be used for.
+    """
+    try:
+        source = sqlite_path(settings)
+    except NotSupported:
+        # Not a SQLite deployment: render it into one. See the note there.
+        snapshot_other_database(settings, destination)
+        return COPIED
+
     connection = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
     try:
         connection.execute("VACUUM INTO ?", (str(destination),))
+        return VACUUMED
+    except sqlite3.DatabaseError as e:
+        log.warning("VACUUM INTO failed (%s); falling back to a raw copy", e)
     finally:
         connection.close()
+
+    shutil.copyfile(source, destination)
+    for suffix in ("-wal", "-shm"):
+        sidecar = source.with_name(source.name + suffix)
+        if sidecar.is_file():
+            shutil.copyfile(sidecar, destination.with_name(destination.name + suffix))
+    return RAW
+
+
+def integrity_report(settings: Settings, limit: int = 20) -> dict:
+    """What SQLite says about the file, from a read-only connection.
+
+    The one question that could not be asked from outside the container, and
+    the one whose answer reframed everything: requests were failing in ways
+    that looked like contention — fast 500s on some logins and not others,
+    the same count twice — and none of it was contention. The file was
+    damaged, and every guard built for concurrency was treating a symptom.
+
+    `integrity_check` rather than `quick_check`: the cheap one skips exactly
+    the index checking that turned out to matter here, and this database is
+    small enough that reading all of it costs little. Bounded to `limit`
+    problems, because a badly damaged file can report thousands and the first
+    few say as much as all of them.
+    """
+    url = settings.resolved_database_url
+    if not url.startswith("sqlite"):
+        return {"note": "not a SQLite deployment"}
+    path = url.split("sqlite:///", 1)[-1]
+    try:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
+    except sqlite3.Error as e:  # pragma: no cover - the file is unopenable
+        return {"ok": False, "error": repr(e)}
+    try:
+        rows = connection.execute(f"PRAGMA integrity_check({int(limit)})").fetchall()
+    except sqlite3.DatabaseError as e:
+        # Damaged past the point of being able to say how.
+        return {"ok": False, "error": repr(e)}
+    finally:
+        connection.close()
+
+    problems = [row[0] for row in rows if row and row[0] != "ok"]
+    return {"ok": not problems, "problems": problems}
 
 
 def build(settings: Settings, workspace: Path) -> Path:
@@ -110,30 +253,55 @@ def build(settings: Settings, workspace: Path) -> Path:
     # and naming the snapshot after the source makes the two collide the
     # moment the workspace and the data directory are the same place.
     database = workspace / f"snapshot-{secrets.token_hex(8)}.db"
-    snapshot_database(settings, database)
+    kind = snapshot_database(settings, database)
 
     data = Path(settings.data_dir)
     images = sorted(p for p in (data / "images").glob("*") if p.is_file())
     config = data / "quizbinf.env"
+    certificates = tls_files(settings)
 
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
         bundle.write(database, "quizbinf.db")
+        if kind == RAW:
+            # The raw copy's write-ahead log holds the commits that are not in
+            # the database file yet; a recovery without it silently loses them.
+            for suffix in ("-wal", "-shm"):
+                sidecar = database.with_name(database.name + suffix)
+                if sidecar.is_file():
+                    bundle.write(sidecar, f"quizbinf.db{suffix}")
         for image in images:
             bundle.write(image, f"images/{image.name}")
+        for certificate in certificates:
+            bundle.write(certificate, certificate.name)
         if config.is_file():
             bundle.writestr(
                 "quizbinf.env", redact_config(config.read_text(encoding="utf-8"))
             )
         bundle.writestr(
             "README.txt",
-            _readme(taken, database.stat().st_size, len(images), config.is_file()),
+            _readme(
+                taken,
+                database.stat().st_size,
+                len(images),
+                config.is_file(),
+                kind,
+                certificates,
+            ),
         )
 
-    database.unlink()
+    for path in (database, *(database.with_name(database.name + s) for s in ("-wal", "-shm"))):
+        path.unlink(missing_ok=True)
     return archive
 
 
-def _readme(taken: datetime, db_bytes: int, image_count: int, had_config: bool) -> str:
+def _readme(
+    taken: datetime,
+    db_bytes: int,
+    image_count: int,
+    had_config: bool,
+    kind: str = VACUUMED,
+    certificates: Sequence[Path] = (),
+) -> str:
     config_line = (
         "quizbinf.env  the configuration, with every secret value replaced by a\n"
         "              placeholder. The keys tell you what has to be set on a new\n"
@@ -143,6 +311,17 @@ def _readme(taken: datetime, db_bytes: int, image_count: int, had_config: bool) 
         else "quizbinf.env  not present — this deployment is configured by environment\n"
         "              variables rather than by a file on the volume.\n"
     )
+    certificate_note = _certificate_note(certificates)
+    restore = (
+        "To restore, put quizbinf.db and images/ into the new deployment's data\n"
+        "directory (/home/data by default), put each certificate listed above back\n"
+        "at the path named for it, fill in the secrets in quizbinf.env, and start\n"
+        "the app."
+        if certificates
+        else "To restore, put quizbinf.db and images/ into the new deployment's data\n"
+        "directory (/home/data by default), fill in the secrets in quizbinf.env, and\n"
+        "start the app."
+    )
     return f"""quizbinf backup
 taken {taken:%Y-%m-%d %H:%M} UTC
 
@@ -151,16 +330,76 @@ and every answer they have given. Treat this file the way you would treat the
 Participants view: keep it somewhere only you can read, and delete copies you
 no longer need.
 
-  quizbinf.db   the whole database, taken with SQLite's VACUUM INTO so it is a
-                consistent copy rather than a possibly torn file. {db_bytes:,} bytes.
+  quizbinf.db   the whole database. {db_bytes:,} bytes.
+{_database_note(kind)}
   images/       {image_count} uploaded figure(s). Questions reference these by
                 path, so a database restored without them shows broken images.
-  {config_line}
-To restore, put quizbinf.db and images/ into the new deployment's data
-directory (/home/data by default), fill in the secrets in quizbinf.env, and
-start the app. It runs `alembic upgrade head` at startup, so a snapshot from an
+  {config_line}{certificate_note}
+{restore} It runs `alembic upgrade head` at startup, so a snapshot from an
 older version migrates itself forward.
 
 What this does NOT protect against: it is a copy you took by hand at one
 moment. Anything answered after this file was made is not in it.
+
+Check it before you rely on it:
+  python3 -c "import sqlite3; print(sqlite3.connect('quizbinf.db')\
+      .execute('PRAGMA integrity_check').fetchall())"
+[('ok',)] means this is a restore point. Do it when you take the backup, not
+when you need it.
 """
+
+
+def _database_note(kind: str) -> str:
+    if kind == COPIED:
+        return (
+            "                This deployment's database is not SQLite. What is here is\n"
+            "                every row of it, copied table by table into a SQLite file so\n"
+            "                that the archive stays portable: openable by anyone,\n"
+            "                checkable with PRAGMA integrity_check, restorable onto either\n"
+            "                backend, and needing no pg_dump of a matching version.\n"
+            "                It carries the tables this application defines and nothing\n"
+            "                else — no roles, no grants, no objects outside the ORM — so\n"
+            "                it is NOT a substitute for a dump taken on the database host.\n"
+            "                It is the portable copy of the data that cannot be recreated."
+        )
+    if kind == VACUUMED:
+        return (
+            "                Taken with SQLite's VACUUM INTO, so it is a consistent copy\n"
+            "                rather than a possibly torn file."
+        )
+    return (
+        "\n"
+        "                *** WARNING: THIS IS A RAW COPY, NOT A CLEAN SNAPSHOT ***\n"
+        "                VACUUM INTO failed on the live database, which means it is\n"
+        "                damaged. Rather than hand you nothing, this is a byte copy of\n"
+        "                the file as it stood, plus its -wal (the recent commits live\n"
+        "                there under WAL and are lost without it).\n"
+        "                It may be torn and it may not open. To salvage what is in it:\n"
+        "                    sqlite3 quizbinf.db .recover > rescued.sql\n"
+        "                    sqlite3 rescued.db < rescued.sql\n"
+        "                Then run PRAGMA integrity_check on rescued.db before using it."
+    )
+
+
+def _certificate_note(certificates: Sequence[Path]) -> str:
+    """Name each certificate and the path it has to go back to.
+
+    The path matters more than the file: `DATABASE_URL` names it absolutely,
+    so a restore that puts the certificate somewhere else is a deployment that
+    cannot open a connection, with nothing in the log about a backup.
+    """
+    if not certificates:
+        return ""
+    lines = []
+    for certificate in certificates:
+        lines.append(
+            f"  {certificate.name}\n"
+            "                the CA certificate this deployment's database connection is\n"
+            "                verified against. It belongs at\n"
+            f"                {certificate}\n"
+            "                which is the path DATABASE_URL names. It is a public\n"
+            "                certificate and not a secret, but it IS required: under\n"
+            "                sslmode=verify-full the app refuses to connect without it,\n"
+            "                so a restore that leaves it behind will not start.\n"
+        )
+    return "".join(lines)

@@ -15,13 +15,26 @@ within a month.
 
 import asyncio
 import inspect
+import time
+from pathlib import Path
 
 from sqlalchemy import text
 
 from app import main
 from app.auth import COOKIE_NAME, current_user
-from app.config import get_settings
-from app.db import SQLITE_POOL_SIZE, SessionLocal, engine, journal_mode
+from app.config import Settings, get_settings
+from app import db as db_module
+from app import service
+from app.db import (
+    POOL_SIZE,
+    POOL_TIMEOUT,
+    SessionLocal,
+    WriteQueueTimeout,
+    engine,
+    engine_options,
+    journal_mode,
+    writing,
+)
 from app.routers import sessions
 from tests.conftest import login, make_quiz_with_question
 
@@ -42,7 +55,48 @@ def test_the_pool_is_larger_than_the_number_of_requests_allowed_in():
     the door — where waiting is all that happens — instead of at the pool,
     where waiting turns into a 500 for a student who has already submitted.
     """
-    assert SQLITE_POOL_SIZE > main.REQUEST_SLOTS
+    assert POOL_SIZE > main.REQUEST_SLOTS
+
+
+POSTGRES_URL = "postgresql+psycopg://u:p@db.example:5432/quizbinf?sslmode=verify-full"
+
+
+def test_a_postgres_deployment_gets_the_same_pool():
+    """The pool was once sized for SQLite only.
+
+    A Postgres deployment then ran on SQLAlchemy's default of 5 + 10
+    connections behind 40 request slots, so a class arriving at once would
+    have queued at the pool and failed after `POOL_TIMEOUT`: exactly the
+    failure the sizing exists to rule out, reintroduced by changing databases.
+    """
+    options = engine_options(POSTGRES_URL)
+    assert options["pool_size"] > main.REQUEST_SLOTS
+    assert options["pool_size"] == engine_options(get_settings().resolved_database_url)["pool_size"]
+
+
+def test_a_postgres_deployment_survives_losing_its_connections():
+    """A networked database drops connections that a file never does.
+
+    A server restart or a firewall that forgets an idle connection leaves dead
+    connections in the pool; pinging on checkout replaces them before a
+    request fails on one. And a server that does not answer at all must fail
+    a request within seconds rather than hold its thread for libpq's default
+    of waiting forever.
+    """
+    options = engine_options(POSTGRES_URL)
+    assert options["pool_pre_ping"] is True
+    assert 0 < options["connect_args"]["connect_timeout"] < POOL_TIMEOUT
+
+
+def test_the_postgres_options_are_ones_the_engine_accepts():
+    """Built without connecting, so it needs no server, only valid arguments."""
+    from sqlalchemy import create_engine
+
+    probe = create_engine(POSTGRES_URL, **engine_options(POSTGRES_URL))
+    try:
+        assert probe.pool.size() == POOL_SIZE
+    finally:
+        probe.dispose()
 
 
 def test_sqlite_runs_in_wal_mode():
@@ -126,17 +180,19 @@ def test_health_answers_without_touching_the_database(client):
     needed a connection it would be the first casualty of the failure it
     exists to diagnose — which is why the journal mode it reports is read once
     at startup and cached.
+
+    The pool is exhausted with *raw* connections rather than by running a
+    query on each. Since `BEGIN IMMEDIATE`, a query starts a write
+    transaction, and sixty of those cannot coexist by design — the earlier
+    version of this test held sixty read transactions open, which was legal
+    then and is a sixty-deep queue now. Checking a connection out without
+    using it still empties the pool, which is the condition under test.
     """
-    # Hold every connection the pool can give out — overflow included, or the
-    # pool is merely busy and this proves nothing — exactly as a stuck app
-    # does. Anything that needs the database now blocks for `pool_timeout`.
     capacity = engine.pool.size() + engine.pool._max_overflow
     held = []
     try:
         while len(held) < capacity:
-            session = SessionLocal()
-            session.execute(text("SELECT 1"))
-            held.append(session)
+            held.append(engine.raw_connection())
         assert engine.pool.checkedout() == capacity
 
         response = client.get("/api/health")
@@ -147,8 +203,58 @@ def test_health_answers_without_touching_the_database(client):
             "health must report the exhaustion it is being asked about"
         )
     finally:
-        for session in held:
-            session.close()
+        for connection in held:
+            connection.close()
+
+
+def test_a_read_then_write_does_not_fail_instantly(teacher_client, make_client):
+    """The failure that took a lecture down, and it is not about speed.
+
+    Every endpoint here reads before it writes. SQLAlchemy opens that as a
+    deferred transaction — a reader asking to become a writer at the first
+    INSERT — and if another connection has committed in between, SQLite
+    refuses *immediately*, without consulting `busy_timeout`, because waiting
+    could deadlock. On the deployment 152 of 200 concurrent logins died that
+    way, each in about 19 ms, and each one was a student who could not sign
+    in. It never showed up locally, where the window between the read and the
+    write is 0.02 ms rather than the 6 ms a mounted volume costs.
+
+    `BEGIN IMMEDIATE` is what makes concurrent writers queue instead of fail.
+    This drives the same shape through the app: many clients reading and then
+    writing at once, all of which must succeed.
+    """
+    import concurrent.futures
+
+    quiz_id, question_id, choice_ids = make_quiz_with_question(teacher_client)
+    code = teacher_client.post(f"/api/sessions?quiz_id={quiz_id}").json()["code"]
+    teacher_client.post(
+        f"/api/sessions/{code}/rounds", json={"question_id": question_id, "phase": "pre"}
+    )
+
+    students = []
+    for i in range(16):
+        student = make_client()
+        login(student, f"racer{i}")
+        students.append(student)
+
+    def read_then_write(pair):
+        index, student = pair
+        # `/state` reads and records the participant; the answer reads the
+        # open round and writes. Both are the read-then-write shape.
+        student.get(f"/api/sessions/{code}/state")
+        return student.post(
+            f"/api/sessions/{code}/answers",
+            json={"choice_id": choice_ids[index % len(choice_ids)]},
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(pool.map(read_then_write, enumerate(students)))
+
+    failed = [r for r in results if r.status_code != 200]
+    assert not failed, (
+        f"{len(failed)} of {len(results)} lost the read-to-write upgrade: "
+        f"{[r.text[:80] for r in failed[:3]]}"
+    )
 
 
 def test_health_reports_the_pool_so_a_freeze_can_be_seen(client):
@@ -325,3 +431,451 @@ def test_rejoining_does_not_write_every_time(teacher_client, make_client):
     # And the row is still there, so `joined` is unaffected.
     with SessionLocal() as db:
         assert db.query(SessionParticipant).count() == 1
+
+
+def test_a_reader_does_not_wait_for_a_writer(teacher_client, make_client):
+    """The regression the *second* load test found, and the reason for the
+    read/write split in `db.py`.
+
+    The first fix for the read-to-write upgrade made every transaction
+    immediate — including the SELECT `current_user` does on the way into every
+    request in the app. That took SQLite's exclusive write lock once per
+    request, so the whole application serialised behind a lock only one
+    request could hold at a time. Against the deployment: 350 answers shed
+    with 503, the concurrency cap saturated at 40 in flight while the
+    connection pool sat almost idle, and only 41 of 200 students managed to
+    join at all.
+
+    A pool with capacity to spare and a saturated request cap is the signature
+    of it: the requests were not waiting for the database, they were waiting
+    for each other.
+
+    So: hold the write gate, and require a plain read to be served anyway.
+    Under WAL a deferred reader sees the last committed state and waits for
+    nobody, which is the whole reason WAL is on. Make `_begin` in `db.py`
+    unconditional again and this test is what stops it.
+    """
+    import threading
+
+    quiz_id, question_id, _ = make_quiz_with_question(teacher_client)
+    code = teacher_client.post(f"/api/sessions?quiz_id={quiz_id}").json()["code"]
+
+    student = make_client()
+    login(student, "reader")
+    student.get(f"/api/sessions/{code}/state")  # so the participant row exists
+
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hold_the_write_lock():
+        db = SessionLocal()
+        try:
+            with writing(db):
+                db.execute(text("UPDATE sessions SET code = code"))
+                holding.set()
+                release.wait(timeout=10)
+        finally:
+            db.close()
+
+    writer = threading.Thread(target=hold_the_write_lock, daemon=True)
+    writer.start()
+    try:
+        assert holding.wait(timeout=5), "the writer never took the lock"
+        started = time.perf_counter()
+        resp = student.get(f"/api/sessions/{code}/state")
+        took = time.perf_counter() - started
+    finally:
+        release.set()
+        writer.join(timeout=10)
+
+    assert resp.status_code == 200
+    # Generously above anything a local read costs and far below the ten
+    # seconds the writer holds the lock for: this asserts *whether* it waited,
+    # not how fast the machine is.
+    assert took < 2.0, f"a read waited {took:.1f}s for a writer that holds the lock"
+
+
+def test_a_writer_that_cannot_get_a_turn_says_busy_rather_than_broken(monkeypatch):
+    """Refusing to write is a 503, never a 500.
+
+    The two are not interchangeable to a phone: 503 with `Retry-After` says
+    "ask again", which the student view acts on by re-sending the answer with
+    a jittered backoff, while a 500 says the server is broken and invites
+    nobody to retry. What this replaced was SQLite exhausting its busy timeout
+    and raising `database is locked`, which reached the student as a 500.
+    """
+    import threading
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    # The setting, not the module constant: the timeout is read from
+    # configuration at each call so it can be retuned on a deployment without
+    # a rebuild. Patching the constant here passed anyway — by waiting the
+    # full five seconds — which is a test agreeing with itself rather than
+    # with the code.
+    monkeypatch.setattr(get_settings(), "write_queue_seconds", 0.1)
+
+    probe = FastAPI()
+    probe.add_exception_handler(WriteQueueTimeout, main.write_queue_timeout)
+
+    @probe.post("/write")
+    def write() -> dict:
+        db = SessionLocal()
+        try:
+            with writing(db):
+                db.execute(text("UPDATE sessions SET code = code"))
+            return {"ok": True}
+        finally:
+            db.close()
+
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hog():
+        db = SessionLocal()
+        try:
+            with writing(db):
+                holding.set()
+                release.wait(timeout=10)
+        finally:
+            db.close()
+
+    thread = threading.Thread(target=hog, daemon=True)
+    thread.start()
+    try:
+        assert holding.wait(timeout=5)
+        resp = TestClient(probe, raise_server_exceptions=False).post("/write")
+    finally:
+        release.set()
+        thread.join(timeout=10)
+
+    assert resp.status_code == 503, resp.text
+    assert resp.headers.get("Retry-After") == "1"
+
+
+def test_declaring_a_write_twice_is_not_a_deadlock():
+    """`writing()` is reentrant, because the call sites nest.
+
+    A router declares a write and calls a service function that declares one
+    too — `create_session` and `open_round` are both shapes of this. A
+    non-reentrant lock would hang the request against itself, which is exactly
+    the failure the previous round of this work was about.
+    """
+    db = SessionLocal()
+    try:
+        with writing(db):
+            with writing(db):
+                db.execute(text("UPDATE sessions SET code = code"))
+    finally:
+        db.close()
+
+
+def test_reading_the_state_takes_no_write_lock(teacher_client, make_client):
+    """The busiest path in the app must not declare itself a writer.
+
+    `record_participant` runs on `/state` and on the SSE connect, so it is on
+    every request a student makes, and the throttle means it writes on almost
+    none of them. Wrapping the whole function in `writing()` would have been
+    the natural way to satisfy the write-path rule and would have reinstated
+    the serialisation this suite exists to prevent, from the busiest path
+    there is.
+    """
+    quiz_id, question_id, _ = make_quiz_with_question(teacher_client)
+    code = teacher_client.post(f"/api/sessions?quiz_id={quiz_id}").json()["code"]
+    student = make_client()
+    login(student, "settled")
+    student.get(f"/api/sessions/{code}/state")  # first call creates the row
+
+    seen = []
+    original = db_module.writing
+
+    def watched(db):
+        seen.append(True)
+        return original(db)
+
+    db_module.writing = watched
+    service.writing = watched
+    try:
+        assert student.get(f"/api/sessions/{code}/state").status_code == 200
+    finally:
+        db_module.writing = original
+        service.writing = original
+    assert not seen, "a settled student's /state asked for the write lock"
+
+
+def test_health_says_which_build_is_running(client):
+    """"The fix did not work" and "the fix was never deployed" look identical.
+
+    They looked identical for most of a week. `/api/health` now carries a hash
+    of the application's own source, so a load test against a deployment can
+    be checked against the checkout it was supposed to be testing before its
+    numbers are believed.
+    """
+    body = client.get("/api/health").json()
+    assert body["code"] == main.CODE_FINGERPRINT
+    assert len(body["code"]) == 8
+    # Stable across calls: computed once at startup, not per request.
+    assert client.get("/api/health").json()["code"] == body["code"]
+
+
+def test_a_write_outside_writing_is_noticed():
+    """The split is only as good as its call sites, so a missed one is loud.
+
+    In production this logs and lets the statement through — it is the
+    behaviour every build before `writing()` had, and breaking a feature
+    outright is worse than the rare 500 it risks. In the test suite it raises,
+    which is what makes CI the place a missed write path is found. That
+    substitution is installed in `conftest.py` and is why every other test in
+    this repository is also an assertion that its write paths are declared.
+    """
+    noticed = []
+    original = db_module.on_undeclared_write
+    db_module.on_undeclared_write = noticed.append
+    db = SessionLocal()
+    try:
+        db.execute(text("UPDATE sessions SET code = code"))
+        db.commit()
+    finally:
+        db_module.on_undeclared_write = original
+        db.close()
+
+    assert noticed, "an undeclared write went unnoticed"
+    assert "UPDATE" in noticed[0]
+
+
+def test_health_reports_the_write_queue(client):
+    """The one number that tells this failure from the last one.
+
+    A saturated request cap over an idle connection pool is what *both* looked
+    like from outside: the previous fix's serialisation, and the pool
+    exhaustion before it. Telling them apart took deploying a change and
+    running the load test again. `waiting` says directly whether requests are
+    queueing for the write lock, which is the app's remaining hard limit and
+    the one a bigger machine does not raise.
+    """
+    queue = client.get("/api/health").json()["write_queue"]
+    assert queue["waiting"] == 0
+    assert queue["longest_wait"] >= 0
+
+
+def test_a_returning_student_signs_in_without_the_write_lock(client, make_client):
+    """The most expensive needless write in the app, and the one that hurts most.
+
+    Every student's arrival goes through the login path, so a class arriving
+    together is 150 calls inside a few seconds. Writing unconditionally — even
+    re-setting `role` to the value it already held — made every one of them
+    queue for the process-wide write lock. Against the deployment: 185 of 200
+    logins refused after the full `WRITE_QUEUE_SECONDS`, 8 students in the
+    session, and the connection pool idle at 15 of 50. Nothing was contended
+    except a lock taken for no reason.
+
+    The first login of a name creates a row and must write. Every login after
+    that has nothing to write, and must not queue behind anybody.
+    """
+    seen = []
+    original = db_module.writing
+
+    def watched(db):
+        seen.append(True)
+        return original(db)
+
+    login(client, "returning")  # creates the row — this one may write
+
+    import app.auth as auth_module
+
+    db_module.writing = watched
+    auth_module.writing = watched
+    try:
+        again = make_client()
+        login(again, "returning")
+    finally:
+        db_module.writing = original
+        auth_module.writing = original
+
+    assert not seen, "a returning student's login asked for the write lock"
+    assert again.get("/api/auth/me").json()["username"] == "returning"
+
+
+def test_a_changed_role_is_still_written(monkeypatch, client, make_client):
+    """The saving above must not become a correctness bug.
+
+    The teacher allowlist in configuration is authoritative on every login —
+    promoting somebody by adding them to `TEACHER_USERNAMES` has to take
+    effect the next time they sign in, which means the skip has to notice that
+    the stored row no longer matches.
+    """
+    login(client, "promoted")
+    assert client.get("/api/auth/me").json()["role"] == "student"
+
+    settings = get_settings()
+    monkeypatch.setattr(
+        settings, "teacher_usernames", settings.teacher_usernames + ",promoted"
+    )
+
+    after = make_client()
+    login(after, "promoted")
+    assert after.get("/api/auth/me").json()["role"] == "teacher"
+
+
+def test_the_write_timeout_can_be_retuned_without_a_rebuild(monkeypatch):
+    """SQLite's one-writer limit is the app's hardest, so its timeout is
+    configuration.
+
+    The request cap already learned this: a limit whose only remedy is
+    building and deploying a new image is one nobody can back out of with a
+    class in the room, and that cap had to be backed out of exactly once. The
+    write queue is the same shape of thing and reaches its ceiling sooner —
+    `WRITE_QUEUE_SECONDS` in the volume's config file, and a restart.
+    """
+    settings = get_settings()
+    assert db_module._write_timeout() == settings.write_queue_seconds
+    monkeypatch.setattr(settings, "write_queue_seconds", 12.5)
+    assert db_module._write_timeout() == 12.5
+
+
+def test_the_pool_is_sized_for_every_backend_not_only_sqlite():
+    """Moving to Postgres must not arrive with the pool-exhaustion failure.
+
+    `pool_size` and `max_overflow` used to be set inside the SQLite branch, so
+    pointing `DATABASE_URL` at Postgres fell back to SQLAlchemy's defaults —
+    five connections with ten overflow, fifteen in total, against forty
+    request slots. That is exactly the shape this constant exists to prevent,
+    and it is documented in CLAUDE.md as having taken a lecture down once
+    already. It would have come back on the first busy lecture after the
+    migration, looking like a brand-new problem.
+    """
+    import sqlalchemy
+
+    for url in ("sqlite:///:memory:", "postgresql+psycopg://u:p@example.invalid/db"):
+        engine = sqlalchemy.create_engine(
+            url,
+            pool_size=db_module.POOL_SIZE,
+            max_overflow=10,
+            poolclass=sqlalchemy.pool.QueuePool,
+        )
+        assert engine.pool.size() >= main.REQUEST_SLOTS, url
+        engine.dispose()
+
+    assert db_module.POOL_SIZE >= main.REQUEST_SLOTS
+
+
+def test_the_write_gate_is_a_sqlite_workaround_not_a_rule(monkeypatch):
+    """A real database server arbitrates its own writers; this must step aside.
+
+    The gate exists because SQLite permits one writer at a time and chooses
+    badly between contenders. Postgres has MVCC and row-level locking, so
+    concurrent writers are the normal case — and serialising them in this
+    process would discard the single largest reason to move to it, while
+    looking exactly like the problem the move was meant to solve.
+
+    `writing()` is called from the service layer, which knows nothing about
+    which backend is configured, so the decision has to live here.
+    """
+    monkeypatch.setattr(db_module, "_serialise_writes", False)
+
+    held_by_writer = []
+    db = SessionLocal()
+    try:
+        with writing(db):
+            # If the gate were taken, this would fail to acquire it.
+            held_by_writer.append(db_module._write_gate.acquire(blocking=False))
+            if held_by_writer[-1]:
+                db_module._write_gate.release()
+            db.execute(text("SELECT 1"))
+    finally:
+        db.close()
+
+    assert held_by_writer == [True], "the write gate was taken on a non-SQLite backend"
+
+
+def test_the_write_gate_still_applies_to_sqlite():
+    """The other half: on SQLite it must still serialise, or the whole
+    read/write split above is undone."""
+    assert db_module._serialise_writes is True, (
+        "the test suite runs on SQLite, so writes must still be serialised"
+    )
+
+    taken = []
+    db = SessionLocal()
+    try:
+        with writing(db):
+            taken.append(db_module._write_gate.acquire(blocking=False))
+            if taken[-1]:
+                db_module._write_gate.release()
+    finally:
+        db.close()
+
+    assert taken == [False], "the write gate was not held while writing()"
+
+
+def test_a_remote_database_without_tls_is_called_out():
+    """The connection to heisenberg carries every student's name and answer.
+
+    Unencrypted it is both a privacy problem and a credential leak — the
+    database password crosses in clear with the rows. A warning rather than a
+    refusal, because the same URL shape is correct for the Postgres container
+    beside the app in docker-compose, where there is no network to cross.
+    """
+    remote = "postgresql+psycopg://quizbinf:pw@heisenberg.scilifelab.se:5432/quizbinf"
+    assert main._database_crosses_a_network_unencrypted(remote)
+
+    with_tls = remote + "?sslmode=require"
+    assert not main._database_crosses_a_network_unencrypted(with_tls)
+
+    for harmless in (
+        "sqlite:////home/data/quizbinf.db",
+        "postgresql+psycopg://u:p@localhost:5432/quizbinf",
+        "postgresql+psycopg://u:p@127.0.0.1:5432/quizbinf",
+        "postgresql+psycopg://u:p@db:5432/quizbinf",  # the compose service name
+    ):
+        assert not main._database_crosses_a_network_unencrypted(harmless), harmless
+
+
+def test_health_does_no_filesystem_work_on_every_request():
+    """The endpoint that must answer during a freeze must not touch the volume.
+
+    `/api/health` reports whether the data directory is writable, and finding
+    that out costs a mkdir, a touch and an unlink — three round trips to a
+    network filesystem, on the volume most likely to *be* the thing that is
+    stuck. Measured against the deployment with a single client and nothing
+    else running, `/api/health` reached 1.4 s while a static file on the same
+    host never passed 0.2 s.
+
+    Cached with a short expiry rather than once at startup, because a volume
+    that goes read-only mid-lecture is exactly what this exists to report.
+    """
+    settings = get_settings()
+    settings.__dict__.pop("_writability", None)
+
+    calls = []
+    real_touch = Path.touch
+
+    def counted(self, *args, **kwargs):
+        calls.append(self)
+        return real_touch(self, *args, **kwargs)
+
+    Path.touch = counted
+    try:
+        for _ in range(20):
+            settings._writable_data_dir()
+    finally:
+        Path.touch = real_touch
+
+    assert len(calls) == 1, f"probed the filesystem {len(calls)} times for 20 calls"
+
+
+def test_a_volume_that_goes_read_only_is_still_noticed(monkeypatch):
+    """The cache must expire, or the reading stops meaning anything."""
+    settings = get_settings()
+    settings.__dict__.pop("_writability", None)
+    assert settings._writable_data_dir() is not None
+
+    monkeypatch.setattr(Settings, "WRITABILITY_TTL", 0.0)
+
+    def refuse(self, *args, **kwargs):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(Path, "touch", refuse)
+    assert settings._writable_data_dir() is None
+    settings.__dict__.pop("_writability", None)
