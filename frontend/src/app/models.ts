@@ -144,6 +144,8 @@ export interface LoginMethods {
   mock_login: boolean;
   roster_login: boolean;
   oidc: boolean;
+  /** The login button's text, naming the provider. */
+  oidc_label?: string;
 }
 
 /** A Canvas course the teacher can sync a roster from. */

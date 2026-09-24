@@ -154,6 +154,10 @@ class Settings(BaseSettings):
     # ("lukask@ug.kth.se"); `unique_name` ("UG\\lukask") is the fallback. Not
     # `sub`, which KTH issues pairwise and is therefore not a username.
     oidc_username_claim: str = "upn"
+    # The login button's text. The default suits KTH; a deployment behind a
+    # different provider (for example SWAMID, through a SATOSA proxy) names
+    # that provider here so students know which account to use.
+    oidc_login_label: str = "Log in with your KTH-id"
 
     # Canvas OAuth2 — student login through Canvas rather than through a
     # university IdP. SU's own IdP speaks SAML through SWAMID and not OIDC;

@@ -19,8 +19,8 @@ import { AuthService } from '../auth.service';
       @if (methods()?.oidc) {
         <!-- Real authentication, so it goes first and reads as the way in.
              The server does the whole flow; this is a plain link because it
-             is a browser redirect to KTH, not an API call. -->
-        <a class="kth primary" [href]="oidcUrl()">Log in with your KTH-id</a>
+             is a browser redirect to the provider, not an API call. -->
+        <a class="kth primary" [href]="oidcUrl()">{{ methods()?.oidc_label || 'Log in with your KTH-id' }}</a>
         @if (loginError) {
           <p class="error">{{ loginError }}</p>
         }
@@ -147,7 +147,7 @@ export class LoginComponent implements OnInit {
 
   /**
    * The server-side flow, carrying where to return to. A full page navigation
-   * rather than an HTTP call: the browser has to follow redirects to KTH and
+   * rather than an HTTP call: the browser has to follow redirects to the provider and
    * back for the provider's own session cookie to be involved.
    */
   oidcUrl(): string {
@@ -156,10 +156,10 @@ export class LoginComponent implements OnInit {
   }
 
   ngOnInit(): void {
-    // The callback sends a declined or failed KTH login back here, so say so
+    // The callback sends a declined or failed login back here, so say so
     // rather than silently showing the form again as if nothing happened.
     if (this.route.snapshot.queryParamMap.get('error') === 'oidc') {
-      this.loginError = 'KTH login did not complete. Please try again.';
+      this.loginError = 'Login did not complete. Please try again.';
     }
 
     // Which form to show is the server's business — a deployment may offer

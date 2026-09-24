@@ -159,6 +159,7 @@ def login_methods(settings: Settings = Depends(get_settings)) -> dict:
         "mock_login": settings.mock_login_allowed,
         "roster_login": settings.roster_login_allowed,
         "oidc": settings.oidc_configured,
+        "oidc_label": settings.oidc_login_label,
         "canvas_oauth": settings.canvas_oauth_configured,
     }
 

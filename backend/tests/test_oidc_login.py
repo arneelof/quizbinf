@@ -250,6 +250,13 @@ def test_methods_reports_oidc_once_configured(client, oidc_configured):
     assert client.get("/api/auth/methods").json()["oidc"] is True
 
 
+def test_the_login_button_says_which_provider(client, oidc_configured, monkeypatch):
+    """KTH by default; another deployment names its own provider."""
+    assert client.get("/api/auth/methods").json()["oidc_label"] == "Log in with your KTH-id"
+    monkeypatch.setattr(oidc_configured, "oidc_login_label", "Log in with your university account")
+    assert client.get("/api/auth/methods").json()["oidc_label"] == "Log in with your university account"
+
+
 # --- claim handling --------------------------------------------------------
 
 
