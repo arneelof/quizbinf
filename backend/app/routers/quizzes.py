@@ -112,6 +112,7 @@ def add_question(
         position=len(quiz.questions),
         text=body.text,
         image_url=body.image_url,
+        mode=body.mode,
     )
     for i, c in enumerate(body.choices):
         question.choices.append(Choice(position=i, text=c.text, is_correct=c.is_correct))
@@ -154,7 +155,7 @@ def edit_question(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Question not found")
     try:
         return service.update_question(
-            db, question, body.text, body.image_url, body.choices
+            db, question, body.text, body.image_url, body.choices, body.mode
         )
     except service.RuleViolation as e:
         raise HTTPException(status.HTTP_409_CONFLICT, str(e))

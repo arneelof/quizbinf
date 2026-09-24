@@ -2,6 +2,7 @@ import { Component, EventEmitter, Input, OnDestroy, Output, signal } from '@angu
 import { FormsModule } from '@angular/forms';
 
 import { ApiService } from '../api.service';
+import { QUESTION_MODES, QuestionMode } from '../models';
 
 export interface ChoiceDraft {
   /** Present when this choice already exists; absent means a new one. */
@@ -13,6 +14,7 @@ export interface ChoiceDraft {
 export interface QuestionDraft {
   text: string;
   choices: ChoiceDraft[];
+  mode: QuestionMode;
 }
 
 /**
@@ -84,6 +86,15 @@ export interface QuestionDraft {
         </div>
       }
 
+      <label class="mode">
+        How it is run
+        <select [(ngModel)]="draft.mode" name="qmode">
+          @for (m of modes; track m.value) {
+            <option [value]="m.value">{{ m.label }}</option>
+          }
+        </select>
+      </label>
+
       <button type="button" (click)="addChoiceRow()">+ choice</button>
       <button (click)="save.emit()" [disabled]="!valid()">{{ submitLabel }}</button>
       @if (showCancel) {
@@ -100,6 +111,8 @@ export interface QuestionDraft {
   `,
   styles: [
     `
+      .mode { display: block; margin: 0.6rem 0; font-size: 0.85rem; color: #555; }
+      .mode select { display: block; margin-top: 0.2rem; max-width: 100%; }
       .choice-row { display: flex; gap: 0.5rem; align-items: center; margin: 0.3rem 0; }
       .mark { display: inline-flex; align-items: center; gap: 0.3rem; cursor: pointer;
               border: 1px solid var(--border); border-radius: 6px; padding: 0.25rem 0.5rem;
@@ -127,6 +140,7 @@ export interface QuestionDraft {
 })
 export class QuestionEditorComponent implements OnDestroy {
   @Input({ required: true }) draft!: QuestionDraft;
+  readonly modes = QUESTION_MODES;
   @Input() submitLabel = 'Save question';
   @Input() showCancel = false;
   @Input() error = '';

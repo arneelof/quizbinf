@@ -17,7 +17,7 @@ from ..auth import current_teacher, current_user
 from ..config import Settings, get_settings
 from ..db import SessionLocal, get_db
 from ..events import broadcaster
-from ..models import Answer, Choice, Phase, Question, Quiz, QuizSession, User
+from ..models import Answer, Choice, Phase, Question, QuestionMode, Quiz, QuizSession, User
 from ..public_base import public_base_url
 from ..schemas import (
     AnswerIn,
@@ -63,11 +63,23 @@ def _state(db: Session, session: QuizSession, user: User | None) -> SessionState
     closed_round = None
     closed_round_question = None
     closed_round_histogram = None
+    closed_round_pre_histogram = None
     if open_round is None:
         closed_round = service.get_last_closed_round(db, session)
         if closed_round is not None:
             closed_round_question = closed_round.question
-            closed_round_histogram = service.round_histogram(db, closed_round)
+            mode = closed_round_question.mode
+            if closed_round.phase == Phase.pre and mode == QuestionMode.twice_end:
+                # Discussion time: the round and question are sent so the
+                # student's page can say so, but the result stays hidden
+                # until the post round has been halted.
+                pass
+            else:
+                closed_round_histogram = service.round_histogram(db, closed_round)
+            if closed_round.phase == Phase.post:
+                pre = service.get_round(db, session, closed_round.question_id, Phase.pre)
+                if pre is not None:
+                    closed_round_pre_histogram = service.round_histogram(db, pre)
 
     return SessionState(
         code=session.code,
@@ -81,6 +93,7 @@ def _state(db: Session, session: QuizSession, user: User | None) -> SessionState
         closed_round=RoundOut.model_validate(closed_round) if closed_round else None,
         closed_round_question=closed_round_question,
         closed_round_histogram=closed_round_histogram,
+        closed_round_pre_histogram=closed_round_pre_histogram,
     )
 
 

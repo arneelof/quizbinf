@@ -34,6 +34,8 @@ import httpx
 QUESTION_HEADING = re.compile(r"^##\s+(.*)$")
 QUIZ_TITLE = re.compile(r"^#\s+(.*)$")
 CHOICE_LINE = re.compile(r"^-\s*\[([ xX])\]\s*(.+)$")
+# A line on its own inside a question block. See docs/quiz-authoring.md.
+MODE_LINE = re.compile(r"^mode:\s*(once|twice|twice[-_]end)\s*$", re.IGNORECASE)
 IMAGE_REF = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)(\{[^}]*\})?")
 
 
@@ -71,8 +73,13 @@ def _parse_question(block: list[str], source_dir: Path) -> dict:
     heading = QUESTION_HEADING.match(block[0]).group(1).strip()
     body_lines = [heading]
     choices: list[tuple[bool, str]] = []
+    mode = "twice"
 
     for line in block[1:]:
+        mode_match = MODE_LINE.match(line.strip())
+        if mode_match:
+            mode = mode_match.group(1).lower().replace("-", "_")
+            continue
         m = CHOICE_LINE.match(line.strip())
         if m:
             is_correct = m.group(1).lower() == "x"
@@ -94,6 +101,7 @@ def _parse_question(block: list[str], source_dir: Path) -> dict:
     return {
         "text": text,
         "choices": [{"text": t, "is_correct": c} for c, t in choices],
+        "mode": mode,
     }
 
 
@@ -163,7 +171,7 @@ def create_quiz(client: httpx.Client, quiz: dict) -> int:
     for q in quiz["questions"]:
         resp = client.post(
             f"/api/quizzes/{quiz_id}/questions",
-            json={"text": q["text"], "choices": q["choices"]},
+            json={"text": q["text"], "choices": q["choices"], "mode": q.get("mode", "twice")},
         )
         if resp.status_code != 201:
             raise FormatError(
@@ -179,7 +187,8 @@ def print_summary(quiz: dict) -> None:
     print(f"Quiz: {quiz['title']}")
     for i, q in enumerate(quiz["questions"], 1):
         first_line = q["text"].splitlines()[0]
-        print(f"\n  {i}. {first_line}")
+        mode = "" if q.get("mode", "twice") == "twice" else f"   (mode: {q['mode']})"
+        print(f"\n  {i}. {first_line}{mode}")
         for c in q["choices"]:
             mark = "x" if c["is_correct"] else " "
             print(f"     [{mark}] {c['text']}")

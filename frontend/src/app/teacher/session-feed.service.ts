@@ -1,7 +1,7 @@
 import { Injectable, OnDestroy, signal } from '@angular/core';
 
 import { ApiService } from '../api.service';
-import { Comparison, Phase, Question, Round, SessionState } from '../models';
+import { Comparison, Phase, Question, QuestionMode, Round, SessionState } from '../models';
 
 /**
  * Shared session data for the three teacher views.
@@ -95,7 +95,20 @@ export class SessionFeed implements OnDestroy {
    */
   showPhase(q: Question, phase: Phase): boolean {
     const open = this.openRoundFor(q);
-    return !(open && open.phase === phase);
+    if (open && open.phase === phase) return false;
+    // `twice_end`: the class discusses without seeing the first split, so it
+    // is held back until the second round has been halted.
+    if (this.mode(q) === 'twice_end' && phase === 'pre') return this.ran(q, 'post');
+    return true;
+  }
+
+  mode(q: Question): QuestionMode {
+    return q.mode ?? 'twice';
+  }
+
+  /** Whether the question has run every round its mode asks for. */
+  finished(q: Question): boolean {
+    return this.mode(q) === 'once' ? this.ran(q, 'pre') : this.ran(q, 'post');
   }
 
   /**
@@ -126,7 +139,7 @@ export class SessionFeed implements OnDestroy {
       return this.questions().find((q) => q.id === open.question_id) ?? null;
     }
     const midway = this.questions().find(
-      (q) => this.ran(q, 'pre') && !this.ran(q, 'post'),
+      (q) => this.ran(q, 'pre') && !this.finished(q),
     );
     return midway ?? this.questions().find((q) => !this.ran(q, 'pre')) ?? null;
   }
@@ -150,7 +163,7 @@ export class SessionFeed implements OnDestroy {
     if (!q) return 'done';
     const open = this.openRoundFor(q);
     if (open) return open.phase;
-    return this.ran(q, 'pre') ? 'discuss' : 'waiting';
+    return this.ran(q, 'pre') && !this.finished(q) ? 'discuss' : 'waiting';
   }
 
   pct(counts: Record<number, number> | null, choiceId: number, q: Question): number {

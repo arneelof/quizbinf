@@ -14,6 +14,19 @@ export interface Choice {
   is_correct?: boolean; // present only in teacher views
 }
 
+/**
+ * How a question is run. `once`: one round, result shown when halted.
+ * `twice`: pre and post, each result shown as it is halted. `twice_end`: pre
+ * and post, nothing shown until post is halted, then both.
+ */
+export type QuestionMode = 'once' | 'twice' | 'twice_end';
+
+export const QUESTION_MODES: { value: QuestionMode; label: string }[] = [
+  { value: 'twice', label: 'Ask twice, show results after each round' },
+  { value: 'twice_end', label: 'Ask twice, show results only after the second (both rounds)' },
+  { value: 'once', label: 'Ask once, show results after it' },
+];
+
 export interface Question {
   id: number;
   position: number;
@@ -23,6 +36,8 @@ export interface Question {
   text_html: string;
   image_url: string | null;
   choices: Choice[];
+  /** Optional so mocks that predate modes keep compiling; absent means `twice`. */
+  mode?: QuestionMode;
 }
 
 export interface Quiz {
@@ -53,6 +68,8 @@ export interface SessionState {
   closed_round?: Round | null;
   closed_round_question?: Question | null;
   closed_round_histogram?: Record<number, number> | null;
+  /** With a closed post round: the same question's pre distribution. */
+  closed_round_pre_histogram?: Record<number, number> | null;
 }
 
 export interface Histogram {
@@ -128,6 +145,7 @@ export interface QuestionInput {
   text: string;
   image_url: string | null;
   choices: ChoiceInput[];
+  mode?: QuestionMode;
 }
 
 /**
@@ -181,4 +199,5 @@ export interface QuestionEditInput {
   text: string;
   image_url: string | null;
   choices: ChoiceEditInput[];
+  mode?: QuestionMode;
 }

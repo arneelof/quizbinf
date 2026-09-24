@@ -357,9 +357,10 @@ export class TeacherDashboardComponent implements OnInit {
     this.api.listQuizzes().subscribe((qs) => this.quizzes.set(qs));
   }
 
-  private blankDraft() {
+  private blankDraft(): QuestionDraft {
     return {
       text: '',
+      mode: 'twice',
       choices: [
         { text: '', is_correct: false },
         { text: '', is_correct: false },
@@ -458,6 +459,7 @@ export class TeacherDashboardComponent implements OnInit {
     this.editError.set('');
     this.editDraft = {
       text: q.text,
+      mode: q.mode ?? 'twice',
       choices: q.choices.map((c) => ({
         id: c.id,
         text: c.text,
@@ -482,6 +484,7 @@ export class TeacherDashboardComponent implements OnInit {
         text: this.editDraft.text.trim(),
         image_url: null,
         choices: this.editDraft.choices.filter((c) => c.text.trim()),
+        mode: this.editDraft.mode,
       })
       .subscribe({
         next: () => {
@@ -548,7 +551,12 @@ export class TeacherDashboardComponent implements OnInit {
     this.formError = '';
     const choices = this.draft.choices.filter((c) => c.text.trim());
     this.api
-      .addQuestion(quiz.id, { text: this.draft.text.trim(), image_url: null, choices })
+      .addQuestion(quiz.id, {
+        text: this.draft.text.trim(),
+        image_url: null,
+        choices,
+        mode: this.draft.mode,
+      })
       .subscribe({
         next: () => {
           this.draft = this.blankDraft();

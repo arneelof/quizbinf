@@ -3,7 +3,7 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 from .markdown import render as render_markdown
-from .models import Phase, Role
+from .models import Phase, QuestionMode, Role
 
 
 class UserOut(BaseModel):
@@ -50,6 +50,7 @@ class QuestionIn(BaseModel):
     text: str = Field(min_length=1)
     image_url: str | None = None
     choices: list[ChoiceIn] = Field(min_length=2)
+    mode: QuestionMode = QuestionMode.twice
 
     @model_validator(mode="after")
     def exactly_one_correct(self) -> "QuestionIn":
@@ -75,6 +76,9 @@ class QuestionEdit(BaseModel):
     text: str = Field(min_length=1)
     image_url: str | None = None
     choices: list[ChoiceEdit] = Field(min_length=2)
+    # Absent means "leave it as it is", so a client that predates modes
+    # cannot reset one by saving a typo fix.
+    mode: QuestionMode | None = None
 
     @model_validator(mode="after")
     def exactly_one_correct(self) -> "QuestionEdit":
@@ -115,6 +119,7 @@ class QuestionOut(BaseModel):
     text: str
     image_url: str | None
     choices: list[ChoiceOut]
+    mode: QuestionMode = QuestionMode.twice
 
     @computed_field
     @property
@@ -183,6 +188,11 @@ class SessionState(BaseModel):
     closed_round: RoundOut | None = None
     closed_round_question: QuestionOut | None = None
     closed_round_histogram: dict[int, int] | None = None
+    # When the closed round is a post round, the same question's pre
+    # distribution, so both can be shown side by side. Never set for a
+    # `twice_end` question before its post round is halted, because the
+    # point of that mode is that the pre result stays hidden until then.
+    closed_round_pre_histogram: dict[int, int] | None = None
 
 
 class HistogramOut(BaseModel):

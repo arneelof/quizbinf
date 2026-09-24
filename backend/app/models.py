@@ -32,6 +32,27 @@ class Phase(str, enum.Enum):
     post = "post"
 
 
+class QuestionMode(str, enum.Enum):
+    """How many times a question is asked, and when students see the result.
+
+    - `once`: a single round; the result is shown when it is halted.
+    - `twice`: pre and post rounds, each result shown as soon as that round
+      is halted (the default).
+    - `twice_end`: pre and post rounds, but nothing is shown until the post
+      round is halted, and then both distributions are. The class discusses
+      without knowing how everyone else voted.
+    """
+
+    once = "once"
+    twice = "twice"
+    twice_end = "twice_end"
+
+    @property
+    def phases(self) -> tuple["Phase", ...]:
+        """The rounds this question is asked in."""
+        return (Phase.pre,) if self is QuestionMode.once else (Phase.pre, Phase.post)
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -127,6 +148,13 @@ class Question(Base):
     position: Mapped[int] = mapped_column(default=0)
     text: Mapped[str] = mapped_column(Text)  # markdown allowed
     image_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Stored as its string value: a native enum would need a migration of its
+    # own on Postgres every time a mode is added.
+    mode: Mapped[QuestionMode] = mapped_column(
+        Enum(QuestionMode, native_enum=False, length=16),
+        default=QuestionMode.twice,
+        server_default=QuestionMode.twice.value,
+    )
 
     quiz: Mapped[Quiz] = relationship(back_populates="questions")
     choices: Mapped[list["Choice"]] = relationship(

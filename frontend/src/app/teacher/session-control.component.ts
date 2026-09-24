@@ -1,7 +1,7 @@
 import { Component, OnDestroy, OnInit, signal } from '@angular/core';
 
 import { ApiService } from '../api.service';
-import { Phase, Question } from '../models';
+import { Phase, Question, QUESTION_MODES } from '../models';
 import { SessionFeed } from './session-feed.service';
 
 /** How often to refresh the answer counter while a round is open. */
@@ -20,7 +20,7 @@ const POLL_MS = 2000;
     <div class="wrap">
       <p class="status" [class.open]="feed.anyOpen()">
         @if (feed.openRound(); as r) {
-          <strong>OPEN</strong> — {{ r.phase === 'pre' ? 'first' : 'second' }} answers ·
+          <strong>OPEN</strong> — {{ statusPhase(r.phase, r.question_id) }} answers ·
           {{ answered() }} answer{{ answered() === 1 ? '' : 's' }} in
           <button class="halt" (click)="halt(r.id)">Halt submission</button>
         } @else {
@@ -57,12 +57,19 @@ const POLL_MS = 2000;
           </button>
 
           <div class="controls">
-            <button (click)="open(q, 'pre')" [disabled]="feed.anyOpen() || ran(q, 'pre')">
-              {{ ran(q, 'pre') ? '✓ 1st bout done' : 'Open 1st bout (pre)' }}
-            </button>
-            <button (click)="open(q, 'post')" [disabled]="feed.anyOpen() || ran(q, 'post')">
-              {{ ran(q, 'post') ? '✓ 2nd bout done' : 'Open 2nd bout (post)' }}
-            </button>
+            @if (feed.mode(q) === 'once') {
+              <button (click)="open(q, 'pre')" [disabled]="feed.anyOpen() || ran(q, 'pre')">
+                {{ ran(q, 'pre') ? '✓ Asked' : 'Open question' }}
+              </button>
+            } @else {
+              <button (click)="open(q, 'pre')" [disabled]="feed.anyOpen() || ran(q, 'pre')">
+                {{ ran(q, 'pre') ? '✓ 1st bout done' : 'Open 1st bout (pre)' }}
+              </button>
+              <button (click)="open(q, 'post')" [disabled]="feed.anyOpen() || ran(q, 'post')">
+                {{ ran(q, 'post') ? '✓ 2nd bout done' : 'Open 2nd bout (post)' }}
+              </button>
+            }
+            <span class="mode-tag" [title]="modeLabel(q)">{{ modeTag(q) }}</span>
             @if (hasRun(q)) {
               <button class="reset" (click)="reset(q)" title="Discard this question's answers and run it again">
                 ↺ Reset
@@ -154,6 +161,22 @@ export class TeacherSessionControlComponent implements OnInit, OnDestroy {
    */
   canNarrow(): boolean {
     return !!this.feed.openRound() && this.feed.questions().length > 1;
+  }
+
+  modeTag(q: Question): string {
+    return { once: 'asked once', twice: 'results each round', twice_end: 'results at the end' }[
+      this.feed.mode(q)
+    ];
+  }
+
+  modeLabel(q: Question): string {
+    return QUESTION_MODES.find((m) => m.value === this.feed.mode(q))?.label ?? '';
+  }
+
+  statusPhase(phase: Phase, questionId: number): string {
+    const q = this.feed.questions().find((x) => x.id === questionId);
+    if (q && this.feed.mode(q) === 'once') return 'the';
+    return phase === 'pre' ? 'first' : 'second';
   }
 
   toggleReveal(questionId: number): void {

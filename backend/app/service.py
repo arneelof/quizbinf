@@ -18,6 +18,7 @@ from .models import (
     Choice,
     DeviceClaim,
     Phase,
+    QuestionMode,
     Question,
     Quiz,
     QuizSession,
@@ -54,6 +55,8 @@ def open_round(db: Session, session: QuizSession, question: Question, phase: Pha
     )
     if existing is not None:
         raise RuleViolation(f"The {phase.value} round for this question was already run")
+    if phase not in question.mode.phases:
+        raise RuleViolation("This question is asked only once")
     if phase == Phase.post:
         pre = db.scalar(
             select(Round).where(
@@ -83,6 +86,16 @@ def close_round(db: Session, round_: Round) -> Round:
 def get_open_round(db: Session, session: QuizSession) -> Round | None:
     return db.scalar(
         select(Round).where(Round.session_id == session.id, Round.closed_at.is_(None))
+    )
+
+
+def get_round(db: Session, session: QuizSession, question_id: int, phase: Phase) -> Round | None:
+    return db.scalar(
+        select(Round).where(
+            Round.session_id == session.id,
+            Round.question_id == question_id,
+            Round.phase == phase,
+        )
     )
 
 
@@ -384,11 +397,12 @@ def semester_participation(
     bouts? Correctness is deliberately absent — this is the attendance record,
     not a mark.
 
-    "Took part" means the student answered *both* the pre and the post round
-    of every question that was asked in both bouts in that session. A question
-    that never got its second bout is not counted against anyone, and a
-    session where no question ran both bouts has nothing to attend, reported
-    as None rather than a failure.
+    "Took part" means the student answered every round of every question that
+    was fully asked in that session: both the pre and the post round, or just
+    the one round of a question whose mode is `once`. A question that never
+    got its second bout is not counted against anyone, and a session where no
+    question was fully asked has nothing to attend, reported as None rather
+    than a failure.
 
     `pairs` is carried alongside the yes/no so a partial attendance is still
     visible: a strict all-or-nothing verdict would otherwise hide a student
@@ -407,9 +421,12 @@ def semester_participation(
             if round_.question is None:
                 continue  # stranded by a question deleted under an older build
             by_question.setdefault(round_.question_id, {})[round_.phase.value] = round_
-        both_bouts = [
-            phases for phases in by_question.values() if "pre" in phases and "post" in phases
-        ]
+        # Each fully asked question, as the rounds a student had to answer.
+        both_bouts = []
+        for phases in by_question.values():
+            needed = [phase.value for phase in next(iter(phases.values())).question.mode.phases]
+            if all(p in phases for p in needed):
+                both_bouts.append([phases[p] for p in needed])
 
         answered_in: dict[int, set[int]] = {}  # round_id -> user ids
         for phases in by_question.values():
@@ -426,9 +443,8 @@ def semester_participation(
         for user_id in users:
             completed = sum(
                 1
-                for phases in both_bouts
-                if user_id in answered_in[phases["pre"].id]
-                and user_id in answered_in[phases["post"].id]
+                for needed in both_bouts
+                if all(user_id in answered_in[r.id] for r in needed)
             )
             tally.setdefault(user_id, {})[session.id] = (completed, len(both_bouts))
 
@@ -853,6 +869,7 @@ def update_question(
     text: str,
     image_url: str | None,
     choices: list,
+    mode: QuestionMode | None = None,
 ) -> Question:
     """Edit a question in place, keeping recorded answers readable.
 
@@ -890,6 +907,10 @@ def update_question(
 
     question.text = text
     question.image_url = image_url
+    if mode is not None:
+        # Allowed at any time: it governs rounds not yet run and what is
+        # shown, never what was recorded.
+        question.mode = mode
 
     kept: list[Choice] = []
     for position, incoming in enumerate(choices):
