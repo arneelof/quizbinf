@@ -133,6 +133,44 @@ def exchange_code(
         raise OidcError("Identity provider returned a malformed token response") from exc
 
 
+def fetch_userinfo(document: dict, access_token: str) -> dict:
+    """The userinfo endpoint's claims, for providers that keep them out of the ID token.
+
+    In the code flow a provider may put only `sub` in the ID token and serve
+    everything the scopes asked for here instead. SATOSA does exactly that
+    (quiz.bioinfo.se logs in through SWAMID via a SATOSA proxy), and so do
+    others. Only called when the ID token carries no username.
+    """
+    endpoint = document.get("userinfo_endpoint")
+    if not endpoint:
+        raise OidcError("ID token has no username and the provider has no userinfo endpoint")
+    try:
+        with httpx.Client(timeout=TIMEOUT, follow_redirects=True) as client:
+            response = client.get(endpoint, headers={"Authorization": f"Bearer {access_token}"})
+    except httpx.HTTPError as exc:
+        raise OidcError(f"Could not reach the identity provider: {exc}") from exc
+    if response.status_code != 200:
+        raise OidcError(f"Userinfo request failed ({response.status_code}): {response.text[:300]}")
+    try:
+        info = response.json()
+    except ValueError as exc:
+        raise OidcError("Identity provider returned malformed userinfo") from exc
+    if not isinstance(info, dict):
+        raise OidcError("Identity provider returned malformed userinfo")
+    return info
+
+
+def merge_userinfo(claims: dict, info: dict) -> dict:
+    """ID-token claims, topped up from userinfo.
+
+    OIDC Core §5.3.2: the userinfo `sub` must match the ID token's, or the
+    response is not about this user and must not be used.
+    """
+    if info.get("sub") != claims.get("sub"):
+        raise OidcError("Userinfo is about a different user than the ID token")
+    return {**info, **claims}
+
+
 def _decode_segment(segment: str) -> dict:
     padding = "=" * (-len(segment) % 4)
     return json.loads(base64.urlsafe_b64decode(segment + padding))

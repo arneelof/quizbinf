@@ -26,6 +26,7 @@ DISCOVERY = {
     "issuer": ISSUER,
     "authorization_endpoint": f"{ISSUER}/oidc/authorize",
     "token_endpoint": f"{ISSUER}/oidc/token",
+    "userinfo_endpoint": f"{ISSUER}/oidc/userinfo",
 }
 
 
@@ -67,12 +68,15 @@ def oidc_configured(monkeypatch):
 @pytest.fixture
 def provider(monkeypatch):
     """Stub the identity provider, recording what we sent it."""
-    calls = {"token_request": None}
+    calls = {"token_request": None, "userinfo_auth": None}
 
-    def install(token_response, status_code=200):
+    def install(token_response, status_code=200, userinfo=None, userinfo_status=200):
         def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path.endswith("openid-configuration"):
                 return httpx.Response(200, json=DISCOVERY)
+            if request.url.path.endswith("userinfo"):
+                calls["userinfo_auth"] = request.headers.get("authorization")
+                return httpx.Response(userinfo_status, json=userinfo or {})
             calls["token_request"] = dict(
                 parse_qs(request.content.decode(), keep_blank_values=True)
             )
@@ -312,3 +316,57 @@ def test_discovery_is_cached(oidc_configured, provider):
     # A second call must not need the provider at all.
     oidc._discovery_cache[ISSUER] = (oidc._discovery_cache[ISSUER][0], {"marker": True, **first})
     assert oidc.discover(ISSUER).get("marker") is True
+
+
+def test_a_username_only_in_userinfo_is_fetched_from_there(client, oidc_configured, provider):
+    """SATOSA (saml2.bioinfo.se, SWAMID) puts only `sub` in the ID token and
+    serves the profile claims from userinfo, as the code flow allows."""
+    calls = provider(
+        {"id_token": id_token(base_claims()), "access_token": "at-123"},
+        userinfo={"sub": "u1abcdef", "preferred_username": "abcd1234@su.se", "name": "Anna Test"},
+    )
+    state = _start_flow(client, "/")
+    client.get(f"/api/auth/callback?code=abc&state={state}", follow_redirects=False)
+
+    assert calls["userinfo_auth"] == "Bearer at-123"
+    me = client.get("/api/auth/me").json()
+    assert me["username"] == "abcd1234"
+    assert me["display_name"] == "Anna Test"
+
+
+def test_userinfo_is_not_fetched_when_the_id_token_has_a_username(client, oidc_configured, provider):
+    calls = provider(
+        {"id_token": id_token(base_claims(upn="shiraza@ug.kth.se")), "access_token": "at-123"},
+        userinfo={"sub": "u1abcdef", "preferred_username": "someone-else"},
+    )
+    state = _start_flow(client, "/")
+    client.get(f"/api/auth/callback?code=abc&state={state}", follow_redirects=False)
+
+    assert calls["userinfo_auth"] is None
+    assert client.get("/api/auth/me").json()["username"] == "shiraza"
+
+
+def test_userinfo_about_another_subject_is_refused(client, oidc_configured, provider):
+    provider(
+        {"id_token": id_token(base_claims()), "access_token": "at-123"},
+        userinfo={"sub": "someone-else", "preferred_username": "mallory@su.se"},
+    )
+    state = _start_flow(client, "/")
+    resp = client.get(f"/api/auth/callback?code=abc&state={state}")
+
+    assert resp.status_code == 502
+    assert "different user" in resp.json()["detail"]
+    assert client.get("/api/auth/me").status_code == 401
+
+
+def test_a_failed_userinfo_request_is_reported(client, oidc_configured, provider):
+    provider(
+        {"id_token": id_token(base_claims()), "access_token": "at-123"},
+        userinfo={"error": "invalid_token"},
+        userinfo_status=401,
+    )
+    state = _start_flow(client, "/")
+    resp = client.get(f"/api/auth/callback?code=abc&state={state}")
+
+    assert resp.status_code == 502
+    assert "Userinfo request failed (401)" in resp.json()["detail"]

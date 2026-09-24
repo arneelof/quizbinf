@@ -376,6 +376,15 @@ def oidc_callback(
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e))
 
     username = oidc.username_from_claims(claims, settings.oidc_username_claim)
+    if not username and tokens.get("access_token"):
+        try:
+            claims = oidc.merge_userinfo(
+                claims, oidc.fetch_userinfo(document, tokens["access_token"])
+            )
+        except oidc.OidcError as e:
+            log.error("oidc: %s", e)
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e))
+        username = oidc.username_from_claims(claims, settings.oidc_username_claim)
     if not username:
         log.error("oidc: no username claim; got %s", sorted(claims))
         raise HTTPException(
