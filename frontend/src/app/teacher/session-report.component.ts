@@ -99,7 +99,8 @@ import { SessionFeed } from './session-feed.service';
                   }
                 </p>
 
-                <div class="draw">
+                <!-- An anonymous session has no names to draw. -->
+                <div class="draw" [hidden]="feed.state()?.anonymous">
                   <button type="button" (click)="draw(q)" [disabled]="drawing() === q.id">
                     {{ hasDraw(q) ? 'Draw again' : 'Draw two to explain' }}
                   </button>

@@ -20,9 +20,16 @@ import { SessionFeed } from './session-feed.service';
       <a routerLink="join" routerLinkActive="active">Join</a>
       <a routerLink="control" routerLinkActive="active">Control</a>
       <a routerLink="report" routerLinkActive="active">Report</a>
-      <a routerLink="people" routerLinkActive="active" class="private">
-        <span aria-hidden="true">🔒</span> Participants
-      </a>
+      @if (feed.state()?.anonymous) {
+        <!-- Nobody is named in an anonymous session, so no Participants view. -->
+        <span class="anon" title="Students join without logging in; answers are not linked to anyone">
+          Anonymous
+        </span>
+      } @else {
+        <a routerLink="people" routerLinkActive="active" class="private">
+          <span aria-hidden="true">🔒</span> Participants
+        </a>
+      }
       <span class="hint">open a view in a second window to project it</span>
     </nav>
 
@@ -41,6 +48,7 @@ import { SessionFeed } from './session-feed.service';
       .views a.active { background: #2c7a51; color: #fff; border-color: #2c7a51; }
       /* Flagged in the nav: unlike the others, this view must not be projected. */
       .views a.private { border-style: dashed; }
+      .anon { padding: 0.4rem 0.9rem; border-radius: 6px; background: #eee; color: #555; }
       .hint { font-size: 0.8rem; color: #888; margin-left: auto; }
       .error { max-width: 46rem; margin: 1rem auto; padding: 0 1rem; color: #c0392b; }
     `,

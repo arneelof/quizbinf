@@ -194,7 +194,16 @@ import { QuestionDraft, QuestionEditorComponent } from './question-editor.compon
         <section class="quiz">
           <header>
             <h2>{{ quiz.title }}</h2>
-            <button (click)="startSession(quiz)">Run session ▶</button>
+            <span class="run">
+              <button (click)="startSession(quiz)">Run session ▶</button>
+              <button
+                class="anon"
+                (click)="startSession(quiz, true)"
+                title="Students join without logging in. Answers are not linked to anyone, and the session is left out of participation reports and Canvas."
+              >
+                Run anonymously
+              </button>
+            </span>
           </header>
 
           @if (reorderError(); as msg) {
@@ -292,6 +301,8 @@ import { QuestionDraft, QuestionEditorComponent } from './question-editor.compon
                   padding: 0.35rem 0.7rem; text-decoration: none; color: inherit; }
       .quiz { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
       header { display: flex; justify-content: space-between; align-items: center; }
+      header .run { display: flex; gap: 0.4rem; }
+      header .anon { background: #fff; color: #555; border: 1px solid #bbb; }
       li.correct { font-weight: 600; color: #2c7; }
       .reveal { font-size: 0.75rem; padding: 0.15rem 0.45rem; margin-top: 0.2rem;
                 color: #777; background: none; }
@@ -566,8 +577,8 @@ export class TeacherDashboardComponent implements OnInit {
       });
   }
 
-  startSession(quiz: Quiz): void {
-    this.api.createSession(quiz.id).subscribe((s) => {
+  startSession(quiz: Quiz, anonymous = false): void {
+    this.api.createSession(quiz.id, anonymous).subscribe((s) => {
       this.router.navigate(['/teacher/session', s.code]);
     });
   }

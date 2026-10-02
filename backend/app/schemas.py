@@ -149,6 +149,7 @@ class SessionOut(BaseModel):
     code: str
     quiz_id: int
     created_at: datetime
+    is_anonymous: bool = False
 
 
 class OpenRoundIn(BaseModel):
@@ -181,6 +182,9 @@ class SessionState(BaseModel):
     open_round: RoundOut | None
     question: QuestionOut | None  # the open round's question, choices unmarked
     my_choice_id: int | None = None
+    # Students join without logging in and their answers are not linked to
+    # them; the student page says so.
+    anonymous: bool = False
     # Populated only while no round is open, so a student's own device can
     # show the same bar chart the teacher's Report view reveals once
     # submissions are halted. Cleared the moment a new round opens (a round

@@ -12,8 +12,14 @@ from sqlalchemy.orm import Session
 from sse_starlette.sse import EventSourceResponse
 from starlette.concurrency import run_in_threadpool
 
-from .. import service
-from ..auth import current_teacher, current_user
+from .. import access, service
+from ..auth import (
+    current_teacher,
+    current_user,
+    guest_for_session,
+    optional_user,
+    read_guest,
+)
 from ..config import Settings, get_settings
 from ..db import SessionLocal, get_db, writing
 from ..events import broadcaster
@@ -94,6 +100,7 @@ def _state(db: Session, session: QuizSession, user: User | None) -> SessionState
         closed_round_question=closed_round_question,
         closed_round_histogram=closed_round_histogram,
         closed_round_pre_histogram=closed_round_pre_histogram,
+        anonymous=session.is_anonymous,
     )
 
 
@@ -135,6 +142,7 @@ async def _broadcast_state(session_code: str) -> None:
 def create_session(
     quiz_id: int,
     loadtest: bool = False,
+    anonymous: bool = False,
     db: Session = Depends(get_db),
     teacher: User = Depends(current_teacher),
 ) -> QuizSession:
@@ -145,12 +153,15 @@ def create_session(
     passing for any run that is not a real class, because nothing in the app
     deletes a session afterwards except `DELETE /api/sessions/{code}`, which
     refuses anything but a rehearsal.
+
+    `anonymous=true` lets students join without logging in and keeps their
+    answers unlinked to them — see `QuizSession.is_anonymous`.
     """
     quiz = db.get(Quiz, quiz_id)
-    if quiz is None or quiz.owner_id != teacher.id:
+    if quiz is None or not access.can_manage(quiz, teacher):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Quiz not found")
     with writing(db):
-        session = QuizSession(quiz_id=quiz.id, is_loadtest=loadtest)
+        session = QuizSession(quiz_id=quiz.id, is_loadtest=loadtest, is_anonymous=anonymous)
         db.add(session)
         db.commit()
         db.refresh(session)
@@ -262,7 +273,7 @@ def _open_round_sync(
     db: Session, code: str, body: OpenRoundIn, teacher: User
 ) -> RoundOut:
     session = _session_by_code(db, code)
-    if session.quiz.owner_id != teacher.id:
+    if not access.can_manage(session.quiz, teacher):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your session")
     question = db.get(Question, body.question_id)
     if question is None:
@@ -299,7 +310,7 @@ def _close_round_sync(
     db: Session, code: str, round_id: int, teacher: User
 ) -> RoundOut:
     session = _session_by_code(db, code)
-    if session.quiz.owner_id != teacher.id:
+    if not access.can_manage(session.quiz, teacher):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your session")
     round_ = next((r for r in session.rounds if r.id == round_id), None)
     if round_ is None:
@@ -358,7 +369,7 @@ def histogram(
     teacher: User = Depends(current_teacher),
 ) -> HistogramOut:
     session = _session_by_code(db, code)
-    if session.quiz.owner_id != teacher.id:
+    if not access.can_manage(session.quiz, teacher):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your session")
     round_ = next((r for r in session.rounds if r.id == round_id), None)
     if round_ is None:
@@ -382,7 +393,7 @@ def participants(
     worth projecting.
     """
     session = _session_by_code(db, code)
-    if session.quiz.owner_id != teacher.id:
+    if not access.can_manage(session.quiz, teacher):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your session")
     return ParticipantsOut(
         joined=service.participant_count(db, session),
@@ -392,8 +403,22 @@ def participants(
 
 def _owned_session(db: Session, code: str, teacher: User) -> QuizSession:
     session = _session_by_code(db, code)
-    if session.quiz.owner_id != teacher.id:
+    if not access.can_manage(session.quiz, teacher):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your session")
+    return session
+
+
+def _named_session(db: Session, code: str, teacher: User) -> QuizSession:
+    """`_owned_session` for the views that name students one by one.
+
+    An anonymous session has nobody to name: its members are throwaway guests,
+    so a per-student file or a name draw would be meaningless at best.
+    """
+    session = _owned_session(db, code, teacher)
+    if session.is_anonymous:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "This is an anonymous session: nobody is named in it"
+        )
     return session
 
 
@@ -411,7 +436,8 @@ def participation(
     session = _owned_session(db, code, teacher)
     return ParticipationReportOut(
         questions=session.quiz.questions,
-        rows=service.participation_report(db, session),
+        # Anonymous: the rows would only be guests, so there are none.
+        rows=[] if session.is_anonymous else service.participation_report(db, session),
     )
 
 
@@ -431,7 +457,7 @@ def session_canvas_readiness(
     Names usernames, so teacher-only and the session's own owner, like every
     other view on this page.
     """
-    session = _owned_session(db, code, teacher)
+    session = _named_session(db, code, teacher)
     return service.canvas_match_summary(db, session, course_id or settings.canvas_course_id)
 
 
@@ -455,7 +481,7 @@ def session_canvas_participation_csv(
     Personal data, like every other view of who did what: teacher-only, and
     restricted to the session's own owner.
     """
-    session = _owned_session(db, code, teacher)
+    session = _named_session(db, code, teacher)
     course = course_id or settings.canvas_course_id
     report = service.session_canvas_participation(db, session, course, threshold)
     column = assignment or f"{report['title']} {report['date']}"
@@ -488,7 +514,7 @@ def participation_csv(
     teacher: User = Depends(current_teacher),
 ) -> Response:
     """The same report as CSV, for keeping a participation record."""
-    session = _owned_session(db, code, teacher)
+    session = _named_session(db, code, teacher)
     questions = session.quiz.questions
     rows = service.participation_report(db, session)
 
@@ -534,7 +560,7 @@ def live_count(
     is open would bias the peer discussion that follows.
     """
     session = _session_by_code(db, code)
-    if session.quiz.owner_id != teacher.id:
+    if not access.can_manage(session.quiz, teacher):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your session")
     round_ = service.get_open_round(db, session)
     if round_ is None:
@@ -552,7 +578,7 @@ def comparison(
     teacher: User = Depends(current_teacher),
 ) -> ComparisonOut:
     session = _session_by_code(db, code)
-    if session.quiz.owner_id != teacher.id:
+    if not access.can_manage(session.quiz, teacher):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your session")
     question = db.get(Question, question_id)
     if question is None or question.quiz_id != session.quiz_id:
@@ -580,7 +606,7 @@ def discussants(
     names appear on a screen a lecture hall is looking at, and can draw again
     if someone is absent.
     """
-    session = _owned_session(db, code, teacher)
+    session = _named_session(db, code, teacher)
     question = db.get(Question, question_id)
     if question is None or question.quiz_id != session.quiz_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Question not found")
@@ -595,17 +621,40 @@ def discussants(
 # --- student endpoints -----------------------------------------------------
 
 
+def _member(
+    request: Request, response: Response, db: Session, settings: Settings, session: QuizSession
+) -> User:
+    """Who is acting in `session`: the logged-in user, or in an anonymous
+    session this browser's guest.
+
+    Staff (the quiz's teachers) keep their real identity even in an anonymous
+    session, so the teacher's own screens work as usual; everyone else answers
+    as a guest whether or not they happen to be logged in.
+    """
+    if not session.is_anonymous:
+        return current_user(request, db, settings)
+    real = optional_user(request, db, settings)
+    if access.is_staff(session, real):
+        return real
+    return guest_for_session(request, response, db, settings, session.code)
+
+
 @router.get("/{code}/state", response_model=SessionState)
 def session_state(
-    code: str, db: Session = Depends(get_db), user: User = Depends(current_user)
+    code: str,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
 ) -> SessionState:
     """Full state snapshot; clients call this on connect/reconnect to resync."""
     session = _session_by_code(db, code)
+    user = _member(request, response, db, settings, session)
     # Opening the session is what "joining" means — the projected join screen
     # shows this count so the teacher can see the room filling up before any
-    # round is open. The teacher running it is not a member of the room, and
-    # their own views poll this endpoint, so exclude the owner.
-    if user.id != session.quiz.owner_id:
+    # round is open. The teachers running it are not members of the room, and
+    # their own views poll this endpoint, so exclude them.
+    if not access.is_staff(session, user):
         service.record_participant(db, session, user)
     return _state(db, session, user)
 
@@ -614,8 +663,10 @@ def session_state(
 def submit_answer(
     code: str,
     body: AnswerIn,
+    request: Request,
+    response: Response,
     db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+    settings: Settings = Depends(get_settings),
 ) -> dict:
     """Record one student's answer.
 
@@ -629,6 +680,7 @@ def submit_answer(
     be awaited.
     """
     session = _session_by_code(db, code)
+    user = _member(request, response, db, settings, session)
     round_ = service.get_open_round(db, session)
     if round_ is None:
         raise HTTPException(status.HTTP_409_CONFLICT, "No round is open")
@@ -642,7 +694,7 @@ def submit_answer(
     return {"ok": True, "choice_id": choice.id}
 
 
-def _join_session(code: str, user_id: int) -> str:
+def _join_session(code: str, user_id: int | None) -> str:
     """Find the session, note that the user is following it, return its code.
 
     Opens and closes its own Session so it borrows a pooled connection only
@@ -653,12 +705,35 @@ def _join_session(code: str, user_id: int) -> str:
         session = db.scalar(select(QuizSession).where(QuizSession.code == code))
         if session is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Session not found")
-        user = db.get(User, user_id)
-        if user is not None and user.id != session.quiz.owner_id:
+        user = db.get(User, user_id) if user_id is not None else None
+        if user is not None and not access.is_staff(session, user):
             service.record_participant(db, session, user)
         return session.code
     finally:
         db.close()
+
+
+def _stream_user(
+    code: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> User | None:
+    """Who is following the stream, for `events()`.
+
+    In an anonymous session the stream needs no identity at all: the guest
+    cookie is issued by /state, which the client calls first, and a browser
+    that has none yet is simply not counted until it does. A dependency rather
+    than a lookup in `events()` itself, so that the endpoint's own body still
+    starts by releasing the connection.
+    """
+    session = _session_by_code(db, code)
+    if not session.is_anonymous:
+        return current_user(request, db, settings)
+    real = optional_user(request, db, settings)
+    if access.is_staff(session, real):
+        return real
+    return read_guest(request, db, settings, session.code)
 
 
 @router.get("/{code}/events")
@@ -666,7 +741,7 @@ async def events(
     code: str,
     request: Request,
     db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+    user: User | None = Depends(_stream_user),
 ):
     """SSE stream of session-state changes.
 
@@ -688,7 +763,7 @@ async def events(
     # which needs no database, still answering.
     #
     # The second reason is why the close moved *above* the join. By the time
-    # this body runs, `current_user` has already run a SELECT on this session,
+    # this body runs, `_stream_user` has already run a SELECT on this session,
     # so it holds a connection. Await anything while that is true and the
     # connection is pinned for the duration of the wait — and a class scanning
     # the QR code opens hundreds of these streams at once, all waiting
@@ -696,7 +771,7 @@ async def events(
     # outnumbering the threads actually working, and the pool ran dry again
     # from the opposite direction. Nothing below needs the request's session:
     # `_join_session` takes its own for the moment it runs.
-    user_id = user.id
+    user_id = user.id if user is not None else None
     db.close()
 
     # Off the event loop: this handler must be `async def` because it returns

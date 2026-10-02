@@ -264,3 +264,78 @@ def current_teacher(user: User = Depends(current_user)) -> User:
     if user.role != Role.teacher:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Teacher role required")
     return user
+
+
+def optional_user(request: Request, db: Session, settings: Settings) -> User | None:
+    """The logged-in user, or None for a visitor with no valid login cookie.
+
+    For anonymous sessions only, where not being logged in is fine and a stale
+    cookie should not turn into a login prompt.
+    """
+    try:
+        return current_user(request, db, settings)
+    except HTTPException:
+        return None
+
+
+# --- guests in anonymous sessions -------------------------------------------
+#
+# A browser that opens an anonymous session gets a throwaway identity for that
+# session only. It lives in its own cookie, named after the session code, so it
+# never replaces or reveals a real login: a student who is signed in still
+# answers here as a guest. The cookie is signed, and carries the session code
+# so that it cannot be used in any other session.
+GUEST_COOKIE_PREFIX = "quizbinf_guest_"
+GUEST_MAX_AGE = 12 * 3600  # a lecture, with room to spare
+GUEST_DISPLAY_NAME = "Anonymous"
+
+
+def _guest_serializer(settings: Settings) -> URLSafeTimedSerializer:
+    return URLSafeTimedSerializer(settings.resolved_session_secret, salt="quizbinf-guest")
+
+
+def guest_cookie_name(code: str) -> str:
+    return f"{GUEST_COOKIE_PREFIX}{code}"
+
+
+def read_guest(request: Request, db: Session, settings: Settings, code: str) -> User | None:
+    """This browser's guest for session `code`, if it already has one."""
+    token = request.cookies.get(guest_cookie_name(code))
+    if not token:
+        return None
+    try:
+        data = _guest_serializer(settings).loads(token, max_age=GUEST_MAX_AGE)
+    except BadSignature:
+        return None
+    if data.get("code") != code:
+        return None
+    user = db.scalar(select(User).where(User.username == data.get("username")))
+    db.commit()  # end the read transaction; see current_user
+    if user is None or not user.is_guest:
+        return None
+    return user
+
+
+def guest_for_session(
+    request: Request, response: Response, db: Session, settings: Settings, code: str
+) -> User:
+    """This browser's guest for session `code`, created on first visit."""
+    user = read_guest(request, db, settings, code)
+    if user is not None:
+        return user
+    username = f"guest-{secrets.token_hex(8)}"
+    with writing(db):
+        user = User(
+            username=username, display_name=GUEST_DISPLAY_NAME, role=Role.student, is_guest=True
+        )
+        db.add(user)
+        db.commit()
+    response.set_cookie(
+        guest_cookie_name(code),
+        _guest_serializer(settings).dumps({"username": username, "code": code}),
+        max_age=GUEST_MAX_AGE,
+        httponly=True,
+        samesite="lax",
+        secure=settings.environment == "production",
+    )
+    return user

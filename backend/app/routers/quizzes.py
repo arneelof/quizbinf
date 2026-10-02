@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .. import export, service
+from .. import access, export, service
 from ..auth import current_teacher
 from ..config import Settings, get_settings
 from ..db import get_db, writing
@@ -24,16 +24,21 @@ router = APIRouter(prefix="/api/quizzes", tags=["quizzes"])
 
 def _own_quiz(db: Session, quiz_id: int, teacher: User) -> Quiz:
     quiz = db.get(Quiz, quiz_id)
-    if quiz is None or quiz.owner_id != teacher.id:
+    if quiz is None or not access.can_manage(quiz, teacher):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Quiz not found")
     return quiz
 
 
 @router.get("", response_model=list[QuizOut])
 def list_quizzes(
-    db: Session = Depends(get_db), teacher: User = Depends(current_teacher)
+    db: Session = Depends(get_db),
+    teacher: User = Depends(current_teacher),
+    settings: Settings = Depends(get_settings),
 ) -> list[Quiz]:
-    return list(db.scalars(select(Quiz).where(Quiz.owner_id == teacher.id)))
+    query = select(Quiz).order_by(Quiz.id)
+    if not settings.shared_quizzes:
+        query = query.where(Quiz.owner_id == teacher.id)
+    return list(db.scalars(query))
 
 
 @router.post("", response_model=QuizOut, status_code=status.HTTP_201_CREATED)

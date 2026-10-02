@@ -70,6 +70,8 @@ export interface SessionState {
   closed_round_histogram?: Record<number, number> | null;
   /** With a closed post round: the same question's pre distribution. */
   closed_round_pre_histogram?: Record<number, number> | null;
+  /** Students join without logging in and their answers are not linked to them. */
+  anonymous?: boolean;
 }
 
 export interface Histogram {
@@ -133,6 +135,7 @@ export interface QuizSession {
   code: string;
   quiz_id: number;
   created_at: string;
+  is_anonymous?: boolean;
 }
 
 // Payload shapes for creating a question (no server-assigned ids yet).

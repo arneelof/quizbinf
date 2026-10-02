@@ -61,6 +61,12 @@ class User(Base):
     username: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     display_name: Mapped[str] = mapped_column(String(128))
     role: Mapped[Role] = mapped_column(Enum(Role), default=Role.student)
+    #: A throwaway identity for one anonymous session, created when a browser
+    #: joins it without logging in (see `QuizSession.is_anonymous`). It is
+    #: never a person, so it is left out of every report that names people.
+    is_guest: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
 
 
 class RosterEntry(Base):
@@ -200,6 +206,15 @@ class QuizSession(Base):
     #: attended. `service.sessions_in_range` filters these out, which is the
     #: single place that has to hold for every report at once.
     is_loadtest: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+
+    #: Students join without logging in, and their answers are not linked to
+    #: them. Each browser gets a guest identity for this session only, held
+    #: in its own cookie and separate from any real login, so even a student
+    #: who is already signed in answers anonymously here. The session is left
+    #: out of attendance, the per-student views and the name draw.
+    is_anonymous: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=false()
     )
 

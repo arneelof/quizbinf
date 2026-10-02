@@ -433,6 +433,26 @@ quizbinf/
   could not verify an in-date cookie, i.e. the session secret is not what
   signed it.
 
+## Shared quizzes and anonymous sessions
+
+Who may manage a quiz is decided in one place, `app/access.py`:
+`can_manage(quiz, user)` is "a teacher who owns it", or any teacher when
+`SHARED_QUIZZES=true` (a course taught by several teachers together).
+`is_staff(session, user)` is the same test applied to a session, and is what
+keeps teachers out of participant counts, name draws and reports — not the
+owner check it replaced, which would have counted a colleague watching as a
+student.
+
+A session created with `?anonymous=true` (`QuizSession.is_anonymous`) needs
+no login. `/state` gives each browser a guest `User` (`is_guest`) the first
+time it opens the session, held in a signed cookie named after the session
+code (`app/auth.py`, `guest_for_session`). It is a separate cookie, so a real
+login is neither used nor replaced, and it is bound to its code, so it
+cannot be replayed in another session. Staff keep their real identity. The
+session is excluded from `sessions_in_range` (so from both term reports),
+its participation report is empty, and the views that name students
+(`participation.csv`, the Canvas files, discussants) answer 409.
+
 ## Roster-checked identification (a stop-gap)
 
 Every real login route needs an administrator at KTH to grant something, and

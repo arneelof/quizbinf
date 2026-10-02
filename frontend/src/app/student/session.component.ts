@@ -23,6 +23,9 @@ const RETRYABLE_STATUSES = [0, 502, 503, 504];
     <div class="wrap">
       @if (state(); as s) {
         <h2>{{ s.quiz_title }}</h2>
+        @if (s.anonymous) {
+          <p class="anon">Anonymous — your answers are not linked to you.</p>
+        }
 
         @if (s.open_round && s.question) {
           <p class="phase">
@@ -106,6 +109,7 @@ const RETRYABLE_STATUSES = [0, 502, 503, 504];
   styles: [
     `
       .wrap { max-width: 30rem; margin: 1.5rem auto; padding: 1rem; }
+      .anon { font-size: 0.85rem; color: #666; margin-top: -0.5rem; }
       .phase { font-weight: 600; color: #2c7; text-transform: uppercase; font-size: 0.8rem; }
       .qtext { font-size: 1.2rem; margin: 0.5rem 0 1rem; }
       /* Figures, <pre> and tables in rendered Markdown are sized in

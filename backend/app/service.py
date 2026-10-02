@@ -13,6 +13,8 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from . import access
+from .config import get_settings
 from .db import insert_ignoring_conflict, write_path, writing
 from .models import (
     Answer,
@@ -447,9 +449,13 @@ def sessions_in_range(
     query = (
         select(QuizSession)
         .join(Quiz, QuizSession.quiz_id == Quiz.id)
-        .where(Quiz.owner_id == teacher.id, QuizSession.is_loadtest.is_(False))
+        .where(QuizSession.is_loadtest.is_(False), QuizSession.is_anonymous.is_(False))
         .order_by(QuizSession.created_at, QuizSession.id)
     )
+    # With shared quizzes every teacher reports on every lecture; otherwise a
+    # teacher sees only the lectures of their own quizzes.
+    if not get_settings().shared_quizzes:
+        query = query.where(Quiz.owner_id == teacher.id)
     if start is not None:
         query = query.where(QuizSession.created_at >= datetime.combine(start, time.min))
     if end is not None:
@@ -577,8 +583,8 @@ def session_answering(
 
     def note(user: User) -> bool:
         # The teacher runs the lecture rather than sitting it, and may well
-        # have answered while testing the student view.
-        if user.id == session.quiz.owner_id:
+        # have answered while testing the student view. A guest is nobody.
+        if access.is_staff(session, user) or user.is_guest:
             return False
         users[user.id] = user
         return True
@@ -1121,7 +1127,7 @@ def draw_discussants(
         for answer in round_.answers
     }
     # Exclude the teacher, who may have answered while testing the view.
-    pool = [user for user in answered.values() if user.id != session.quiz.owner_id]
+    pool = [user for user in answered.values() if not access.is_staff(session, user)]
     if len(pool) <= count:
         return sorted(pool, key=lambda u: u.display_name)
     return random.sample(pool, count)
@@ -1165,7 +1171,7 @@ def reel_names(
     others = [
         u.display_name
         for u in users
-        if u.id != session.quiz.owner_id and u.display_name not in drawn
+        if not access.is_staff(session, u) and u.display_name not in drawn
     ]
     random.shuffle(others)
     names = drawn + others[: max(0, limit - len(drawn))]

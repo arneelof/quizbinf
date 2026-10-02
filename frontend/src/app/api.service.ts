@@ -201,9 +201,11 @@ export class ApiService {
   }
 
   // --- teacher: sessions ---
-  createSession(quizId: number): Observable<QuizSession> {
+  /** `anonymous`: students join without logging in; see the backend's `QuizSession.is_anonymous`. */
+  createSession(quizId: number, anonymous = false): Observable<QuizSession> {
+    const flag = anonymous ? '&anonymous=true' : '';
     return this.http.post<QuizSession>(
-      `${API_BASE}/api/sessions?quiz_id=${quizId}`,
+      `${API_BASE}/api/sessions?quiz_id=${quizId}${flag}`,
       {},
       this.opts,
     );

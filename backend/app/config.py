@@ -83,6 +83,10 @@ class Settings(BaseSettings):
 
     # Comma-separated KTH usernames that get the teacher role.
     teacher_usernames: str = ""
+    # Every teacher sees and runs every quiz, and reads every report, instead
+    # of only their own. For a course taught by several teachers together;
+    # see app/access.py.
+    shared_quizzes: bool = False
     # Mock login must be explicitly enabled and is refused in production.
     mock_login: bool = False
     environment: str = "development"  # "development" | "production"

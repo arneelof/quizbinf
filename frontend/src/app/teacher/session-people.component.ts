@@ -21,6 +21,12 @@ import { SessionFeed } from './session-feed.service';
   imports: [DatePipe, FormsModule],
   template: `
     <div class="wrap">
+      @if (feed.state()?.anonymous) {
+        <p class="warning">
+          This is an anonymous session: students answered without logging in,
+          so nobody is named here and it is left out of Canvas.
+        </p>
+      }
       <p class="warning">
         <strong>Personal data — do not project.</strong>
         This page names individual students and how they answered.
