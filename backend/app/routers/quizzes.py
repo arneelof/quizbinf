@@ -38,7 +38,13 @@ def list_quizzes(
     query = select(Quiz).order_by(Quiz.id)
     if not settings.shared_quizzes:
         query = query.where(Quiz.owner_id == teacher.id)
-    return list(db.scalars(query))
+    return sorted(db.scalars(query), key=title_order)
+
+
+def title_order(quiz: Quiz) -> list:
+    """Sort by title with numbers compared as numbers, so "Session 2" comes before "Session 10"."""
+    return [(0, int(part), "") if part.isdigit() else (1, 0, part.casefold())
+            for part in re.split(r"(\d+)", quiz.title)]
 
 
 @router.post("", response_model=QuizOut, status_code=status.HTTP_201_CREATED)
