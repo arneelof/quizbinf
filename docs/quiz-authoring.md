@@ -43,10 +43,11 @@ Rules, matching what `app/schemas.py` enforces server-side:
   Markdown, rendered and sanitised the same way the authoring UI's questions
   are (`app/markdown.py`).
 - Choices are `- [ ]` / `- [x]` lines anywhere in the question's block
-  (conventionally at the end, after the body text). **Exactly one** must be
-  `[x]` — the importer refuses a question with zero or more than one, the
-  same rule `QuestionIn` enforces on the API.
-- At least two choices per question.
+  (conventionally at the end, after the body text). A single-choice question
+  has **at most one** `[x]`; none makes it a poll with no right answer.
+- At least two choices per question that has choices.
+- An optional `type:` line makes it another kind of question (see *Kinds of
+  question* below). Without one, it is single-choice.
 - A figure reference whose path is not `http(s)://` or `/api/...` is treated
   as local: resolved relative to the Markdown file's own directory, uploaded
   through `POST /api/images` and rewritten to the URL the server returns.
@@ -65,6 +66,53 @@ Rules, matching what `app/schemas.py` enforces server-side:
   has been halted. The mode can also be changed later in the question editor.
 - Anything before the `#` title is ignored, so a chapter's own notes or a
   changelog above the quiz content do not need to be stripped out first.
+
+## Kinds of question
+
+A `type:` line, and the settings lines that go with it, sit on their own lines
+in the question's block like `mode:`; none of them is part of the question
+text.
+
+| `type:` | Students give | Shown as | Settings lines |
+|---------|---------------|----------|----------------|
+| *(none)* or `choice` | one choice | bars | `- [x]` on the right one, or none (a poll) |
+| `multi` | all that apply | bars, each the share who ticked it | `- [x]` on every right one (or none) |
+| `rank` | every choice, in order | average place of each | choices, none marked |
+| `number` | a number | histogram, median | `range: 0-100`, `unit: Å`, `answer: 20 ± 1` (all optional) |
+| `scale` | a whole number on a scale | a bar per value, mean | `range: 1-5` (default), `labels: not at all \| completely` |
+| `word` | up to N words | word cloud | `max words: 3` (default) |
+| `text` | a few sentences | anonymous cards; the teacher can hide one | `max length: 500` (default) |
+| `point` | a tap on a figure | every tap on the figure | `figure: file.png`, or the first image in the text |
+
+```markdown
+## How many parameters does this layer have?
+type: number
+answer: 1250 ± 10
+unit: parameters
+
+## How confident are you about backpropagation?
+type: scale
+range: 1-5
+labels: not at all | completely
+mode: once
+
+## One word for what a hidden layer does
+type: word
+max words: 2
+
+## Which are activation functions?
+type: multi
+- [x] ReLU
+- [ ] Adam
+- [x] sigmoid
+```
+
+Only `choice`, `multi` (with a `[x]`) and `number` (with an `answer:`) have a
+right answer; the others count as "answered" in the participation report and
+never as correct. A number's answer, like a correct choice, is never sent to
+students and is shown on the report only after the last round. A student's
+text answer is projected without their name; hiding it (the ✕ on its card)
+removes it from the projector and the phones, and it can be restored.
 
 ## Running the importer
 

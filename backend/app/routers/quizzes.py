@@ -120,7 +120,9 @@ def add_question(
             text=body.text,
             image_url=body.image_url,
             mode=body.mode,
+            kind=body.kind,
         )
+        question.config = body.settings.model_dump() if body.settings else None
         for i, c in enumerate(body.choices):
             question.choices.append(Choice(position=i, text=c.text, is_correct=c.is_correct))
         db.add(question)
@@ -162,8 +164,11 @@ def edit_question(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Question not found")
     try:
         return service.update_question(
-            db, question, body.text, body.image_url, body.choices, body.mode
+            db, question, body.text, body.image_url, body.choices, body.mode,
+            body.kind, body.settings,
         )
+    except service.InvalidQuestion as e:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
     except service.RuleViolation as e:
         raise HTTPException(status.HTTP_409_CONFLICT, str(e))
 

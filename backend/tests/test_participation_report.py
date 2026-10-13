@@ -62,6 +62,7 @@ def test_report_shows_who_was_right_before_and_after(teacher_client):
         "question_id": body["questions"][0]["id"],
         "pre": False,
         "post": True,
+        "graded": True,
     }
     assert rows["bo"]["pre_correct"] == 1 and rows["bo"]["post_correct"] == 1
     assert rows["cecilia"]["pre_correct"] == 0 and rows["cecilia"]["post_correct"] == 0

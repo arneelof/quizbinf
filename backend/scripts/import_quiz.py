@@ -37,6 +37,24 @@ CHOICE_LINE = re.compile(r"^-\s*\[([ xX])\]\s*(.+)$")
 # A line on its own inside a question block. See docs/quiz-authoring.md.
 MODE_LINE = re.compile(r"^mode:\s*(once|twice|twice[-_]end)\s*$", re.IGNORECASE)
 IMAGE_REF = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)(\{[^}]*\})?")
+# The other settings lines of a question block; see docs/quiz-authoring.md.
+SETTING_LINE = re.compile(
+    r"^(type|answer|tolerance|range|unit|labels|max[ _]words|max[ _]length|figure):\s*(.+?)\s*$",
+    re.IGNORECASE,
+)
+KINDS = {
+    "choice": "choice", "single": "choice", "poll": "choice",
+    "multi": "multi", "several": "multi", "multiple": "multi",
+    "rank": "rank", "ranking": "rank", "order": "rank",
+    "number": "number", "numerical": "number",
+    "scale": "scale",
+    "word": "word", "words": "word", "wordcloud": "word", "word cloud": "word",
+    "text": "text", "free text": "text", "long text": "text",
+    "point": "point", "click": "point", "figure": "point", "tap": "point",
+}
+NUMBER = r"(-?\d+(?:\.\d+)?)"
+RANGE = re.compile(rf"^{NUMBER}\s*(?:-|–|to|\.\.)\s*{NUMBER}$", re.IGNORECASE)
+ANSWER = re.compile(rf"^{NUMBER}(?:\s*(?:±|\+-|\+/-)\s*{NUMBER})?$")
 
 
 class FormatError(Exception):
@@ -69,16 +87,61 @@ def parse_quiz(text: str, source_dir: Path) -> dict:
     return {"title": title, "questions": questions}
 
 
+def _number(value: str, what: str, heading: str) -> float:
+    try:
+        x = float(value)
+    except ValueError:
+        raise FormatError(f"Question {heading!r}: {what} {value!r} is not a number")
+    return int(x) if x == int(x) else x
+
+
 def _parse_question(block: list[str], source_dir: Path) -> dict:
     heading = QUESTION_HEADING.match(block[0]).group(1).strip()
     body_lines = [heading]
     choices: list[tuple[bool, str]] = []
     mode = "twice"
+    kind = "choice"
+    settings: dict = {}
+    figure = None
 
     for line in block[1:]:
         mode_match = MODE_LINE.match(line.strip())
         if mode_match:
             mode = mode_match.group(1).lower().replace("-", "_")
+            continue
+        setting = SETTING_LINE.match(line.strip())
+        if setting:
+            key, value = setting.group(1).lower().replace(" ", "_"), setting.group(2)
+            if key == "type":
+                if value.lower() not in KINDS:
+                    raise FormatError(f"Question {heading!r}: unknown type {value!r}; "
+                                      f"use one of {', '.join(sorted(set(KINDS.values())))}")
+                kind = KINDS[value.lower()]
+            elif key == "answer":
+                m = ANSWER.match(value)
+                if not m:
+                    raise FormatError(f"Question {heading!r}: answer {value!r} is not "
+                                      "a number, or a number ± a tolerance")
+                settings["answer"] = _number(m.group(1), "answer", heading)
+                if m.group(2):
+                    settings["tolerance"] = _number(m.group(2), "tolerance", heading)
+            elif key == "tolerance":
+                settings["tolerance"] = _number(value, "tolerance", heading)
+            elif key == "range":
+                m = RANGE.match(value)
+                if not m:
+                    raise FormatError(f"Question {heading!r}: range {value!r} should read like 1-5")
+                settings["min"] = _number(m.group(1), "range", heading)
+                settings["max"] = _number(m.group(2), "range", heading)
+            elif key == "labels":
+                low, _, high = value.partition("|")
+                settings["min_label"], settings["max_label"] = low.strip(), high.strip()
+            elif key in ("max_words", "max_length"):
+                settings[key] = int(_number(value, key.replace("_", " "), heading))
+            elif key == "unit":
+                settings["unit"] = value
+            elif key == "figure":
+                figure = value
             continue
         m = CHOICE_LINE.match(line.strip())
         if m:
@@ -88,21 +151,53 @@ def _parse_question(block: list[str], source_dir: Path) -> dict:
             body_lines.append(line)
 
     text = "\n".join(body_lines).strip()
+    if kind == "point" and figure is None:
+        # The first figure in the text is the one to tap; it moves out of the
+        # text so it is not shown twice.
+        m = IMAGE_REF.search(text)
+        if not m:
+            raise FormatError(f"Question {heading!r}: a point question needs a figure")
+        figure = m.group(2)
+        text = (text[: m.start()] + text[m.end():]).strip()
     text = _resolve_images(text, source_dir)
+    if figure and _is_local(figure) and not (source_dir / figure).is_file():
+        raise FormatError(f"Referenced image not found: {figure}")
 
-    if len(choices) < 2:
-        raise FormatError(f"Question {heading!r} has fewer than 2 choices")
     correct_count = sum(1 for c, _ in choices if c)
-    if correct_count != 1:
-        raise FormatError(
-            f"Question {heading!r} has {correct_count} choices marked [x]; needs exactly 1"
-        )
+    if kind in ("choice", "multi", "rank"):
+        if len(choices) < 2:
+            raise FormatError(f"Question {heading!r} has fewer than 2 choices")
+        if kind == "choice" and correct_count > 1:
+            raise FormatError(
+                f"Question {heading!r} has {correct_count} choices marked [x]; a single-choice "
+                "question has at most 1 (use `type: multi` for several)"
+            )
+        if kind == "rank" and correct_count:
+            raise FormatError(f"Question {heading!r}: a ranking has no choice marked [x]")
+    elif choices:
+        raise FormatError(f"Question {heading!r}: a {kind} question has no `- [ ]` choices")
 
-    return {
+    question = {
         "text": text,
         "choices": [{"text": t, "is_correct": c} for c, t in choices],
         "mode": mode,
     }
+    if kind != "choice":
+        question["kind"] = kind
+    if settings:
+        question["settings"] = settings
+    if figure:
+        question["image_url"] = figure
+    return question
+
+
+def question_payload(q: dict) -> dict:
+    """The JSON for POST /api/quizzes/{id}/questions."""
+    payload = {"text": q["text"], "choices": q["choices"], "mode": q.get("mode", "twice")}
+    for key in ("kind", "settings", "image_url"):
+        if key in q:
+            payload[key] = q[key]
+    return payload
 
 
 def _resolve_images(text: str, source_dir: Path) -> str:
@@ -128,6 +223,8 @@ def _local_image_paths(quiz: dict) -> set[str]:
         for _, path, _ in IMAGE_REF.findall(q["text"]):
             if _is_local(path):
                 paths.add(path)
+        if q.get("image_url") and _is_local(q["image_url"]):
+            paths.add(q["image_url"])
     return paths
 
 
@@ -149,6 +246,8 @@ def upload_images(client: httpx.Client, quiz: dict, source_dir: Path) -> None:
 
     for q in quiz["questions"]:
         q["text"] = IMAGE_REF.sub(replace, q["text"])
+        if q.get("image_url"):
+            q["image_url"] = uploaded.get(q["image_url"], q["image_url"])
 
 
 def _guess_content_type(path: str) -> str:
@@ -171,7 +270,7 @@ def create_quiz(client: httpx.Client, quiz: dict) -> int:
     for q in quiz["questions"]:
         resp = client.post(
             f"/api/quizzes/{quiz_id}/questions",
-            json={"text": q["text"], "choices": q["choices"], "mode": q.get("mode", "twice")},
+            json=question_payload(q),
         )
         if resp.status_code != 201:
             raise FormatError(
@@ -188,7 +287,12 @@ def print_summary(quiz: dict) -> None:
     for i, q in enumerate(quiz["questions"], 1):
         first_line = q["text"].splitlines()[0]
         mode = "" if q.get("mode", "twice") == "twice" else f"   (mode: {q['mode']})"
-        print(f"\n  {i}. {first_line}{mode}")
+        kind = f"   [{q['kind']}]" if "kind" in q else ""
+        print(f"\n  {i}. {first_line}{kind}{mode}")
+        if q.get("settings"):
+            print("     " + ", ".join(f"{k}: {v}" for k, v in q["settings"].items()))
+        if q.get("image_url"):
+            print(f"     figure: {q['image_url']}")
         for c in q["choices"]:
             mark = "x" if c["is_correct"] else " "
             print(f"     [{mark}] {c['text']}")

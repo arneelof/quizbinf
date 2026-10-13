@@ -166,9 +166,19 @@ export class SessionFeed implements OnDestroy {
     return this.ran(q, 'pre') && !this.finished(q) ? 'discuss' : 'waiting';
   }
 
-  pct(counts: Record<number, number> | null, choiceId: number, q: Question): number {
+  /**
+   * A choice's bar as a percentage. `respondents` (from the round's result)
+   * is the denominator when given: for a several-choice question the counts
+   * add up to more than the number of students.
+   */
+  pct(
+    counts: Record<number, number> | null,
+    choiceId: number,
+    q: Question,
+    respondents?: number,
+  ): number {
     if (!counts) return 0;
-    const total = q.choices.reduce((sum, c) => sum + (counts[c.id] || 0), 0);
+    const total = respondents ?? q.choices.reduce((sum, c) => sum + (counts[c.id] || 0), 0);
     return total ? Math.round((100 * (counts[choiceId] || 0)) / total) : 0;
   }
 

@@ -132,8 +132,8 @@ import { SessionFeed } from './session-feed.service';
                 </td>
                 @for (a of row.answers; track a.question_id) {
                   <td class="q">
-                    <span class="mark" [class]="cls(a.pre)">{{ glyph(a.pre) }}</span>
-                    <span class="mark" [class]="cls(a.post)">{{ glyph(a.post) }}</span>
+                    <span class="mark" [class]="cls(a.pre, a.graded)">{{ glyph(a.pre, a.graded) }}</span>
+                    <span class="mark" [class]="cls(a.post, a.graded)">{{ glyph(a.post, a.graded) }}</span>
                   </td>
                 }
                 <td class="tot">{{ row.pre_correct }}</td>
@@ -146,7 +146,8 @@ import { SessionFeed } from './session-feed.service';
           Each cell shows the answer before and after the discussion:
           <span class="mark ok">✓</span> correct,
           <span class="mark no">✗</span> wrong,
-          <span class="mark none">–</span> did not answer.
+          <span class="mark none">–</span> did not answer,
+          <span class="mark ok">•</span> answered a question with no right answer (not counted as correct).
         </p>
       }
     </div>
@@ -228,11 +229,12 @@ export class TeacherSessionPeopleComponent implements OnInit {
     );
   }
 
-  cls(v: boolean | null): string {
-    return v === null ? 'mark none' : v ? 'mark ok' : 'mark no';
+  /** `graded` false: the question has no right answer, and true means "answered". */
+  cls(v: boolean | null, graded = true): string {
+    return v === null ? 'mark none' : v ? 'mark ok' : graded ? 'mark no' : 'mark ok';
   }
 
-  glyph(v: boolean | null): string {
-    return v === null ? '–' : v ? '✓' : '✗';
+  glyph(v: boolean | null, graded = true): string {
+    return v === null ? '–' : !graded ? '•' : v ? '✓' : '✗';
   }
 }

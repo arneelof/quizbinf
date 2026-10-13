@@ -3,7 +3,7 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 from .markdown import render as render_markdown
-from .models import Phase, QuestionMode, Role
+from .models import Phase, QuestionKind, QuestionMode, Role
 
 
 class UserOut(BaseModel):
@@ -46,16 +46,60 @@ class ChoiceIn(BaseModel):
     is_correct: bool = False
 
 
+class QuestionSettings(BaseModel):
+    """Per-kind settings; see `models.QuestionKind`. Unused ones stay None."""
+
+    model_config = ConfigDict(extra="forbid")
+    min: float | None = None
+    max: float | None = None
+    unit: str | None = Field(default=None, max_length=40)
+    answer: float | None = None
+    tolerance: float | None = Field(default=None, ge=0)
+    min_label: str | None = Field(default=None, max_length=60)
+    max_label: str | None = Field(default=None, max_length=60)
+    max_words: int | None = Field(default=None, ge=1, le=10)
+    max_length: int | None = Field(default=None, ge=20, le=2000)
+
+
+def check_question(kind: QuestionKind, choices: list, settings: QuestionSettings | None,
+                   image_url: str | None) -> None:
+    """The rules every kind of question must satisfy, for adding and editing alike."""
+    s = settings or QuestionSettings()
+    correct = sum(1 for c in choices if c.is_correct)
+    if kind.has_choices:
+        if len(choices) < 2:
+            raise ValueError("A question with choices needs at least two")
+        if kind is QuestionKind.choice and correct > 1:
+            raise ValueError("A single-choice question can have at most one correct choice")
+        if kind is QuestionKind.rank and correct:
+            raise ValueError("A ranking question has no correct choice")
+    elif choices:
+        raise ValueError(f"A {kind.value} question has no choices")
+    if s.min is not None and s.max is not None and s.min >= s.max:
+        raise ValueError("min must be smaller than max")
+    if kind is QuestionKind.scale:
+        lo, hi = s.min if s.min is not None else 1, s.max if s.max is not None else 5
+        if lo != int(lo) or hi != int(hi) or not 1 <= hi - lo <= 10:
+            raise ValueError("A scale runs between two whole numbers, at most 10 apart")
+    if kind is QuestionKind.number and s.answer is not None:
+        if (s.min is not None and s.answer < s.min) or (s.max is not None and s.answer > s.max):
+            raise ValueError("The answer must lie between min and max")
+    if kind is QuestionKind.point and not image_url:
+        # Its own figure, not one in the text: that is the one students tap.
+        raise ValueError("A tap-on-the-figure question needs a figure (image_url)")
+
+
 class QuestionIn(BaseModel):
     text: str = Field(min_length=1)
     image_url: str | None = None
-    choices: list[ChoiceIn] = Field(min_length=2)
+    kind: QuestionKind = QuestionKind.choice
+    choices: list[ChoiceIn] = []
+    settings: QuestionSettings | None = None
     mode: QuestionMode = QuestionMode.twice
 
     @model_validator(mode="after")
-    def exactly_one_correct(self) -> "QuestionIn":
-        if sum(1 for c in self.choices if c.is_correct) != 1:
-            raise ValueError("A question must have exactly one correct choice")
+    def valid_for_kind(self) -> "QuestionIn":
+        check_question(self.kind, self.choices, self.settings, self.image_url)
         return self
 
 
@@ -75,16 +119,13 @@ class ChoiceEdit(BaseModel):
 class QuestionEdit(BaseModel):
     text: str = Field(min_length=1)
     image_url: str | None = None
-    choices: list[ChoiceEdit] = Field(min_length=2)
-    # Absent means "leave it as it is", so a client that predates modes
-    # cannot reset one by saving a typo fix.
+    choices: list[ChoiceEdit] = []
+    # Absent means "leave it as it is", so a client that predates modes or
+    # kinds cannot reset one by saving a typo fix. The kind and settings are
+    # checked against the stored question in `service.update_question`.
     mode: QuestionMode | None = None
-
-    @model_validator(mode="after")
-    def exactly_one_correct(self) -> "QuestionEdit":
-        if sum(1 for c in self.choices if c.is_correct) != 1:
-            raise ValueError("A question must have exactly one correct choice")
-        return self
+    kind: QuestionKind | None = None
+    settings: QuestionSettings | None = None
 
 
 class QuestionOrder(BaseModel):
@@ -113,13 +154,16 @@ class ChoiceTeacherOut(ChoiceOut):
 
 
 class QuestionOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
     id: int
     position: int
     text: str
     image_url: str | None
     choices: list[ChoiceOut]
     mode: QuestionMode = QuestionMode.twice
+    kind: QuestionKind = QuestionKind.choice
+    # Students get the settings without the answer (`Question.public_config`).
+    settings: dict = Field(default_factory=dict, validation_alias="public_config")
 
     @computed_field
     @property
@@ -134,6 +178,8 @@ class QuestionOut(BaseModel):
 
 class QuestionTeacherOut(QuestionOut):
     choices: list[ChoiceTeacherOut]
+    settings: dict = Field(default_factory=dict, validation_alias="config")
+    graded: bool = True
 
 
 class QuizOut(BaseModel):
@@ -158,7 +204,14 @@ class OpenRoundIn(BaseModel):
 
 
 class AnswerIn(BaseModel):
-    choice_id: int
+    """One answer; which field is used depends on the question's kind."""
+
+    choice_id: int | None = None  # choice
+    choice_ids: list[int] | None = Field(default=None, max_length=50)  # multi; rank, in order
+    number: float | None = None  # number, scale
+    words: list[str] | None = Field(default=None, max_length=10)  # word
+    text: str | None = Field(default=None, max_length=5000)  # text
+    point: list[float] | None = Field(default=None, min_length=2, max_length=2)  # point: x, y
 
 
 class RoundOut(BaseModel):
@@ -182,6 +235,9 @@ class SessionState(BaseModel):
     open_round: RoundOut | None
     question: QuestionOut | None  # the open round's question, choices unmarked
     my_choice_id: int | None = None
+    # The student's own answer to the open round, in AnswerIn's shape, for
+    # every kind (my_choice_id stays for clients that predate kinds).
+    my_answer: dict | None = None
     # Students join without logging in and their answers are not linked to
     # them; the student page says so.
     anonymous: bool = False
@@ -197,6 +253,10 @@ class SessionState(BaseModel):
     # `twice_end` question before its post round is halted, because the
     # point of that mode is that the pre result stays hidden until then.
     closed_round_pre_histogram: dict[int, int] | None = None
+    # The same rounds as `service.round_result` payloads, for every kind.
+    # Hidden text answers are left out: this is what students see.
+    closed_round_result: dict | None = None
+    closed_round_pre_result: dict | None = None
 
 
 class HistogramOut(BaseModel):
@@ -204,12 +264,16 @@ class HistogramOut(BaseModel):
     phase: Phase
     counts: dict[int, int]  # choice_id -> number of answers
     total: int
+    result: dict | None = None  # `service.round_result`, for every kind
 
 
 class ComparisonOut(BaseModel):
     question_id: int
     pre: dict[int, int] | None
     post: dict[int, int] | None
+    # `service.round_result` per phase, for every kind; None until it has run.
+    pre_result: dict | None = None
+    post_result: dict | None = None
 
 
 class ParticipantsOut(BaseModel):
@@ -225,6 +289,8 @@ class ParticipantAnswerOut(BaseModel):
     question_id: int
     pre: bool | None
     post: bool | None
+    # False for a question with no right answer: then True only means "answered".
+    graded: bool = True
 
 
 class ParticipantRowOut(BaseModel):

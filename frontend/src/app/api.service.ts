@@ -6,6 +6,7 @@ import { API_BASE } from './api.config';
 import {
   CanvasCourse,
   CanvasReadiness,
+  AnswerInput,
   Comparison,
   Draw,
   Histogram,
@@ -368,10 +369,17 @@ export class ApiService {
   sessionState(code: string): Observable<SessionState> {
     return this.http.get<SessionState>(`${API_BASE}/api/sessions/${code}/state`, this.opts);
   }
-  submitAnswer(code: string, choiceId: number): Observable<unknown> {
+  /** A choice id (single-choice questions), or the answer for any kind. */
+  submitAnswer(code: string, answer: number | AnswerInput): Observable<unknown> {
+    const body = typeof answer === 'number' ? { choice_id: answer } : answer;
+    return this.http.post(`${API_BASE}/api/sessions/${code}/answers`, body, this.opts);
+  }
+
+  /** Take a text answer off the projected results, or put it back. */
+  hideAnswer(code: string, answerId: number, hidden: boolean): Observable<unknown> {
     return this.http.post(
-      `${API_BASE}/api/sessions/${code}/answers`,
-      { choice_id: choiceId },
+      `${API_BASE}/api/sessions/${code}/answers/${answerId}/hidden?hidden=${hidden}`,
+      {},
       this.opts,
     );
   }

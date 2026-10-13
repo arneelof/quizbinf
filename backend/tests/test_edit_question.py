@@ -163,11 +163,12 @@ def test_an_asked_question_can_still_be_reworded(teacher_client, student_client)
     assert resp.json()["text"] == "Corrected wording"
 
 
-def test_exactly_one_correct_choice_is_still_required(teacher_client):
+def test_a_single_choice_question_has_at_most_one_correct_choice(teacher_client):
+    """None correct is a poll and is allowed; two is a several-choice question."""
     quiz_id, question_id, _ = make_quiz_with_question(teacher_client)
     q = _question(teacher_client, quiz_id)
 
-    for marks in ([False, False, False], [True, True, False]):
+    for marks in ([True, True, False],):
         resp = teacher_client.put(
             f"/api/quizzes/{quiz_id}/questions/{question_id}",
             json={

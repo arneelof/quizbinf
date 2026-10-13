@@ -5,7 +5,12 @@ and when answers are accepted. The server is the single source of truth for
 whether a round is open — clients never decide based on their own clock.
 """
 
+import json
+import math
 import random
+import re
+import statistics
+from collections import Counter
 from collections.abc import Iterable
 from datetime import date, datetime, time, timedelta, timezone
 
@@ -21,6 +26,7 @@ from .models import (
     Choice,
     DeviceClaim,
     Phase,
+    QuestionKind,
     QuestionMode,
     Question,
     Quiz,
@@ -35,6 +41,11 @@ from .models import (
 
 class RuleViolation(Exception):
     """A domain rule was violated; maps to HTTP 409 at the API layer."""
+
+
+class InvalidQuestion(RuleViolation):
+    """An edit that breaks the rules for its kind of question; HTTP 422, the
+    same as when the request itself fails validation."""
 
 
 @write_path
@@ -127,10 +138,120 @@ def get_last_closed_round(db: Session, session: QuizSession) -> Round | None:
     )
 
 
+#: Longest word or phrase kept from a `word` answer.
+WORD_LENGTH = 40
+#: Default number of words per `word` answer and characters per `text` answer.
+DEFAULT_MAX_WORDS = 3
+DEFAULT_MAX_LENGTH = 500
+
+
+def normalise_word(word: str) -> str:
+    """One entry of a word answer, tidied: trimmed, inner whitespace collapsed,
+    surrounding punctuation dropped, cut to WORD_LENGTH."""
+    word = re.sub(r"\s+", " ", word).strip().strip(".,;:!?\"'()[]")
+    return word[:WORD_LENGTH].strip()
+
+
+def answer_value(question: Question, body) -> tuple[int | None, object]:
+    """Check an `AnswerIn` against the question's kind.
+
+    Returns what is stored: (choice id, None) for a `choice` question and
+    (None, value) for every other kind. Raises RuleViolation for an answer
+    that does not fit the question, which the API turns into a 409 the
+    student's phone shows.
+    """
+    kind = question.kind
+    cfg = question.config
+    choice_ids = {c.id for c in question.choices}
+    if kind is QuestionKind.choice:
+        if body.choice_id not in choice_ids:
+            raise RuleViolation("Choice does not belong to the round's question")
+        return body.choice_id, None
+    if kind in (QuestionKind.multi, QuestionKind.rank):
+        picked = list(body.choice_ids or [])
+        if len(set(picked)) != len(picked) or not set(picked) <= choice_ids:
+            raise RuleViolation("Choice does not belong to the round's question")
+        if kind is QuestionKind.rank and set(picked) != choice_ids:
+            raise RuleViolation("Put every choice in order")
+        if kind is QuestionKind.multi and not picked:
+            raise RuleViolation("Tick at least one choice")
+        return None, picked
+    if kind in (QuestionKind.number, QuestionKind.scale):
+        x = body.number
+        if x is None or not math.isfinite(x):
+            raise RuleViolation("Give a number")
+        lo, hi = cfg.get("min"), cfg.get("max")
+        if kind is QuestionKind.scale:
+            lo, hi = lo if lo is not None else 1, hi if hi is not None else 5
+            if x != int(x):
+                raise RuleViolation("Pick a value on the scale")
+            x = int(x)
+        if (lo is not None and x < lo) or (hi is not None and x > hi):
+            raise RuleViolation(f"Give a number between {lo:g} and {hi:g}" if lo is not None
+                                and hi is not None else "That number is out of range")
+        return None, x
+    if kind is QuestionKind.word:
+        words = [normalise_word(w) for w in (body.words or [])]
+        # One of each, ignoring case: "Magic" and "magic" are one vote.
+        seen: set[str] = set()
+        words = [w for w in words if w and not (w.lower() in seen or seen.add(w.lower()))]
+        if not words:
+            raise RuleViolation("Write at least one word")
+        if len(words) > cfg.get("max_words", DEFAULT_MAX_WORDS):
+            raise RuleViolation(f"At most {cfg.get('max_words', DEFAULT_MAX_WORDS)} words")
+        return None, words
+    if kind is QuestionKind.text:
+        text = (body.text or "").strip()
+        if not text:
+            raise RuleViolation("Write an answer")
+        if len(text) > cfg.get("max_length", DEFAULT_MAX_LENGTH):
+            raise RuleViolation(
+                f"At most {cfg.get('max_length', DEFAULT_MAX_LENGTH)} characters")
+        return None, text
+    if kind is QuestionKind.point:
+        if not body.point or not all(math.isfinite(v) and 0 <= v <= 1 for v in body.point):
+            raise RuleViolation("Tap on the figure")
+        return None, [round(body.point[0], 4), round(body.point[1], 4)]
+    raise RuleViolation("Unknown question kind")  # pragma: no cover
+
+
+def answer_out(answer: Answer | None) -> dict | None:
+    """A stored answer in `AnswerIn`'s shape, for the student's own phone."""
+    if answer is None:
+        return None
+    kind = answer.round.question.kind
+    if kind is QuestionKind.choice:
+        return {"choice_id": answer.choice_id}
+    key = {QuestionKind.multi: "choice_ids", QuestionKind.rank: "choice_ids",
+           QuestionKind.number: "number", QuestionKind.scale: "number",
+           QuestionKind.word: "words", QuestionKind.text: "text",
+           QuestionKind.point: "point"}[kind]
+    return {key: answer.data}
+
+
+def is_correct(question: Question, answer: Answer) -> bool | None:
+    """Whether an answer is right; None for a question without a right answer."""
+    if not question.graded:
+        return None
+    if question.kind is QuestionKind.choice:
+        return any(c.is_correct and c.id == answer.choice_id for c in question.choices)
+    if question.kind is QuestionKind.multi:
+        return set(answer.data or []) == {c.id for c in question.choices if c.is_correct}
+    if question.kind is QuestionKind.number:
+        cfg = question.config
+        return abs(float(answer.data) - cfg["answer"]) <= cfg.get("tolerance", 0) + 1e-9
+    return None
+
+
 @write_path
-def submit_answer(db: Session, round_: Round, user: User, choice: Choice) -> Answer:
+def submit_answer(
+    db: Session, round_: Round, user: User, choice: Choice | None = None, value: object = None
+) -> Answer:
     """Record `user`'s answer; one answer per user per round, last write wins
     while the round is open.
+
+    `choice` for a `choice` question; `value` (from `answer_value`) for every
+    other kind.
 
     On Postgres this runs alongside every other answer in the room, so the two
     things the write gate used to guarantee are arranged here instead:
@@ -147,8 +268,12 @@ def submit_answer(db: Session, round_: Round, user: User, choice: Choice) -> Ans
       both insert; the unique constraint refuses one, and that one runs again
       and updates the row the winner wrote.
     """
-    if choice.question_id != round_.question_id:
+    if choice is not None and choice.question_id != round_.question_id:
         raise RuleViolation("Choice does not belong to the round's question")
+    if choice is None and value is None:
+        raise RuleViolation("No answer given")
+    choice_id = choice.id if choice is not None else None
+    stored = json.dumps(value) if value is not None else None
     for attempt in range(2):
         db.refresh(round_, with_for_update={"read": True})
         if not round_.is_open:
@@ -157,10 +282,12 @@ def submit_answer(db: Session, round_: Round, user: User, choice: Choice) -> Ans
             select(Answer).where(Answer.round_id == round_.id, Answer.user_id == user.id)
         )
         if answer is None:
-            answer = Answer(round_id=round_.id, user_id=user.id, choice_id=choice.id)
+            answer = Answer(round_id=round_.id, user_id=user.id, choice_id=choice_id, value=stored)
             db.add(answer)
         else:
-            answer.choice_id = choice.id
+            answer.choice_id = choice_id
+            answer.value = stored
+            answer.hidden = False
             answer.submitted_at = utcnow()
         try:
             db.commit()
@@ -173,6 +300,17 @@ def submit_answer(db: Session, round_: Round, user: User, choice: Choice) -> Ans
             continue
         db.refresh(answer)
         return answer
+
+
+@write_path
+def set_answer_hidden(db: Session, session: QuizSession, answer_id: int, hidden: bool) -> Answer:
+    """Take a text answer off the projected results, or put it back."""
+    answer = db.get(Answer, answer_id)
+    if answer is None or answer.round.session_id != session.id:
+        raise RuleViolation("No such answer in this session")
+    answer.hidden = hidden
+    db.commit()
+    return answer
 
 
 #: How stale `last_seen_at` may get before it is worth a write.
@@ -369,21 +507,17 @@ def participation_report(db: Session, session: QuizSession) -> list[dict]:
         (r for r in session.rounds if r.question is not None),
         key=lambda r: (r.question_id, r.phase.value),
     )
-    correct_choice: dict[int, int | None] = {}
-    for round_ in rounds:
-        if round_.question_id not in correct_choice:
-            correct = next((c for c in round_.question.choices if c.is_correct), None)
-            correct_choice[round_.question_id] = correct.id if correct else None
-
-    # user_id -> question_id -> phase -> chosen choice id
-    chosen: dict[int, dict[int, dict[str, int]]] = {}
+    # user_id -> question_id -> phase -> right (True/False), or True for a
+    # question without a right answer, where it means only "answered"
+    chosen: dict[int, dict[int, dict[str, bool]]] = {}
     users: dict[int, User] = {}
     for round_ in rounds:
         for answer in round_.answers:
             users[answer.user_id] = answer.user
+            right = is_correct(round_.question, answer)
             chosen.setdefault(answer.user_id, {}).setdefault(round_.question_id, {})[
                 round_.phase.value
-            ] = answer.choice_id
+            ] = True if right is None else right
 
     # Anyone who opened the session counts, even if they never answered:
     # "joined but silent" is exactly what a teacher wants to notice.
@@ -393,6 +527,7 @@ def participation_report(db: Session, session: QuizSession) -> list[dict]:
         users.setdefault(participant.user_id, participant.user)
 
     question_ids = [q.id for q in session.quiz.questions]
+    graded = {q.id: q.graded for q in session.quiz.questions}
 
     rows: list[dict] = []
     for user_id, user in users.items():
@@ -400,18 +535,13 @@ def participation_report(db: Session, session: QuizSession) -> list[dict]:
         pre_correct = post_correct = answered = 0
         for question_id in question_ids:
             picks = chosen.get(user_id, {}).get(question_id, {})
-            right = correct_choice.get(question_id)
-
-            def verdict(phase: str) -> bool | None:
-                if phase not in picks:
-                    return None
-                return right is not None and picks[phase] == right
-
-            pre, post = verdict("pre"), verdict("post")
+            pre, post = picks.get("pre"), picks.get("post")
             answered += sum(1 for v in (pre, post) if v is not None)
-            pre_correct += 1 if pre else 0
-            post_correct += 1 if post else 0
-            per_question.append({"question_id": question_id, "pre": pre, "post": post})
+            if graded[question_id]:
+                pre_correct += 1 if pre else 0
+                post_correct += 1 if post else 0
+            per_question.append({"question_id": question_id, "pre": pre, "post": post,
+                                 "graded": graded[question_id]})
         rows.append(
             {
                 "username": user.username,
@@ -986,6 +1116,8 @@ def update_question(
     image_url: str | None,
     choices: list,
     mode: QuestionMode | None = None,
+    kind: QuestionKind | None = None,
+    settings=None,
 ) -> Question:
     """Edit a question in place, keeping recorded answers readable.
 
@@ -1001,6 +1133,8 @@ def update_question(
     included on purpose: marking the wrong one is exactly the mistake a
     teacher needs to fix, and the per-session report then reads correctly.
     """
+    from .schemas import check_question  # schemas imports models; avoid a cycle
+
     existing = {c.id: c for c in question.choices}
     incoming_ids = {c.id for c in choices if c.id is not None}
 
@@ -1008,12 +1142,34 @@ def update_question(
     if unknown:
         raise RuleViolation("A choice being edited does not belong to this question")
 
+    new_kind = kind if kind is not None else question.kind
+    try:
+        from .schemas import QuestionSettings
+
+        check_question(new_kind, choices,
+                       settings if settings is not None else QuestionSettings(**question.config),
+                       image_url)
+    except ValueError as e:
+        raise InvalidQuestion(str(e))
+    asked = db.scalar(
+        select(func.count()).select_from(Answer).join(Round).where(Round.question_id == question.id)
+    )
+    if new_kind is not question.kind and asked:
+        raise RuleViolation(
+            "Students have already answered this question, so its kind cannot change. "
+            "Reset the question first to discard those answers."
+        )
+
     for choice_id, choice in existing.items():
         if choice_id in incoming_ids:
             continue
-        answered = db.scalar(
-            select(func.count()).select_from(Answer).where(Answer.choice_id == choice_id)
-        )
+        if question.kind is QuestionKind.choice:
+            answered = db.scalar(
+                select(func.count()).select_from(Answer).where(Answer.choice_id == choice_id)
+            )
+        else:
+            # Several-choice and ranking answers keep their choice ids in `value`.
+            answered = asked
         if answered:
             raise RuleViolation(
                 f"“{choice.text}” has already been chosen by students. Reword it "
@@ -1023,6 +1179,9 @@ def update_question(
 
     question.text = text
     question.image_url = image_url
+    question.kind = new_kind
+    if settings is not None:
+        question.config = settings.model_dump()
     if mode is not None:
         # Allowed at any time: it governs rounds not yet run and what is
         # shown, never what was recorded.
@@ -1199,17 +1358,97 @@ def reset_question(db: Session, session: QuizSession, question: Question) -> int
 
 
 def round_histogram(db: Session, round_: Round) -> dict[int, int]:
-    """Aggregate answer counts per choice id. Never exposes who answered what."""
-    counts = {choice.id: 0 for choice in round_.question.choices}
+    """Aggregate answer counts per choice id. Never exposes who answered what.
+
+    For a `multi` question each ticked choice counts once; for `rank`, the
+    choice put first; for `scale`, the counts are per value. Every other kind
+    has no bars to count, and `round_result` carries its result.
+    """
+    question = round_.question
+    if question.kind is QuestionKind.scale:
+        cfg = question.config
+        lo, hi = int(cfg.get("min", 1)), int(cfg.get("max", 5))
+        counts = {v: 0 for v in range(lo, hi + 1)}
+        for answer in round_.answers:
+            counts[int(answer.data)] = counts.get(int(answer.data), 0) + 1
+        return counts
+    if not question.kind.has_choices:
+        return {}
+    counts = {choice.id: 0 for choice in question.choices}
     for answer in round_.answers:
-        counts[answer.choice_id] = counts.get(answer.choice_id, 0) + 1
+        if question.kind is QuestionKind.choice:
+            picked = [answer.choice_id]
+        elif question.kind is QuestionKind.multi:
+            picked = answer.data or []
+        else:
+            picked = (answer.data or [])[:1]
+        for choice_id in picked:
+            counts[choice_id] = counts.get(choice_id, 0) + 1
     return counts
+
+
+def round_result(db: Session, round_: Round, include_hidden: bool = False) -> dict:
+    """Everything needed to draw one round's result, for every kind.
+
+    Aggregated or anonymous only: counts, a list of numbers, words with their
+    counts, the taps, or the text answers without names. `total` is how many
+    answered. Text answers are in a fixed shuffled order, so the order says
+    nothing about who answered first; hidden ones are left out unless
+    `include_hidden` (the teacher's own view, which marks them).
+    """
+    question = round_.question
+    kind = question.kind
+    answers = list(round_.answers)
+    result: dict = {"kind": kind.value, "total": len(answers)}
+    if kind.has_choices or kind is QuestionKind.scale:
+        result["counts"] = round_histogram(db, round_)
+    if kind is QuestionKind.rank:
+        n = len(question.choices)
+        rank_counts = {c.id: [0] * n for c in question.choices}
+        for answer in answers:
+            for position, choice_id in enumerate(answer.data or []):
+                if choice_id in rank_counts and position < n:
+                    rank_counts[choice_id][position] += 1
+        result["rank_counts"] = rank_counts
+        result["mean_rank"] = {
+            cid: (sum((i + 1) * k for i, k in enumerate(row)) / sum(row)) if sum(row) else None
+            for cid, row in rank_counts.items()
+        }
+    if kind in (QuestionKind.number, QuestionKind.scale):
+        values = sorted(float(a.data) for a in answers)
+        result["values"] = values
+        result["mean"] = statistics.fmean(values) if values else None
+        result["median"] = statistics.median(values) if values else None
+    if kind is QuestionKind.word:
+        # Counted case-insensitively, shown in the spelling most people used.
+        spellings: dict[str, Counter] = {}
+        for answer in answers:
+            for word in answer.data or []:
+                spellings.setdefault(word.lower(), Counter())[word] += 1
+        result["words"] = sorted(
+            ({"word": c.most_common(1)[0][0], "count": sum(c.values())}
+             for c in spellings.values()),
+            key=lambda w: (-w["count"], w["word"].lower()),
+        )
+    if kind is QuestionKind.text:
+        texts = [
+            {"id": a.id, "text": a.data, **({"hidden": a.hidden} if include_hidden else {})}
+            for a in answers
+            if include_hidden or not a.hidden
+        ]
+        random.Random(round_.id).shuffle(texts)
+        result["texts"] = texts
+    if kind is QuestionKind.point:
+        result["points"] = [a.data for a in answers if a.data]
+    return result
 
 
 def pre_post_comparison(db: Session, session: QuizSession, question: Question) -> dict:
     """Pre vs post answer distributions for one question in a session."""
-    result: dict = {"question_id": question.id, "pre": None, "post": None}
+    result: dict = {"question_id": question.id, "pre": None, "post": None,
+                    "pre_result": None, "post_result": None}
     for round_ in session.rounds:
         if round_.question_id == question.id:
             result[round_.phase.value] = round_histogram(db, round_)
+            result[f"{round_.phase.value}_result"] = round_result(db, round_, include_hidden=True)
     return result

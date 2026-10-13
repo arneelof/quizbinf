@@ -1,7 +1,7 @@
 import { Component, OnDestroy, OnInit, signal } from '@angular/core';
 
 import { ApiService } from '../api.service';
-import { Phase, Question, QUESTION_MODES } from '../models';
+import { Phase, Question, QUESTION_MODES, describeKind, numberAnswer } from '../models';
 import { SessionFeed } from './session-feed.service';
 
 /** How often to refresh the answer counter while a round is open. */
@@ -47,14 +47,18 @@ const POLL_MS = 2000;
           <!-- The alternatives as the students see them, so the teacher can
                read them out without switching views. Nothing is marked until
                asked for: this screen is often visible from the room. -->
+          @if (describe(q)) { <p class="kind">{{ describe(q) }}</p> }
           <ol class="choices">
             @for (c of q.choices; track c.id) {
               <li [class.correct]="revealed()[q.id] && c.is_correct">{{ c.text }}</li>
             }
           </ol>
-          <button type="button" class="reveal" (click)="toggleReveal(q.id)">
-            {{ revealed()[q.id] ? 'Hide the answer' : 'Show which is correct' }}
-          </button>
+          @if (revealed()[q.id] && answerOf(q)) { <p class="kind correct">Answer: {{ answerOf(q) }}</p> }
+          @if (q.graded !== false) {
+            <button type="button" class="reveal" (click)="toggleReveal(q.id)">
+              {{ revealed()[q.id] ? 'Hide the answer' : 'Show which is correct' }}
+            </button>
+          }
 
           <div class="controls">
             @if (feed.mode(q) === 'once') {
@@ -117,6 +121,8 @@ const POLL_MS = 2000;
       .note { font-size: 0.85rem; color: #777; font-style: italic; }
       .empty { color: #777; }
       .error { color: #c0392b; }
+      .kind { font-size: 0.85rem; color: #777; margin: 0.2rem 0; }
+      .kind.correct { color: #2c7a51; font-weight: 600; }
     `,
   ],
 })
@@ -130,6 +136,15 @@ export class TeacherSessionControlComponent implements OnInit, OnDestroy {
   private timer?: ReturnType<typeof setInterval>;
 
   constructor(public feed: SessionFeed, private api: ApiService) {}
+
+  describe(q: Question): string {
+    return describeKind(q);
+  }
+
+  /** The right number, for a number question, once revealed. */
+  answerOf(q: Question): string {
+    return numberAnswer(q);
+  }
 
   ngOnInit(): void {
     this.refresh();

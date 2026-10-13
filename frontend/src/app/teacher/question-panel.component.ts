@@ -1,5 +1,6 @@
 import { Component } from '@angular/core';
 
+import { Question, describeKind } from '../models';
 import { SessionFeed } from './session-feed.service';
 
 /**
@@ -21,6 +22,8 @@ import { SessionFeed } from './session-feed.service';
           <span class="num">{{ q.position + 1 }}.</span>
           <span [innerHTML]="q.text_html"></span>
         </div>
+        @if (describe(q)) { <p class="kind">{{ describe(q) }}</p> }
+        @if (q.kind === 'point' && q.image_url) { <img class="fig" [src]="q.image_url" alt="" /> }
         <ol class="choices">
           @for (c of q.choices; track c.id) {
             <li>{{ c.text }}</li>
@@ -41,11 +44,17 @@ import { SessionFeed } from './session-feed.service';
       .num { color: #888; margin-right: 0.3rem; }
       .choices { font-size: 1.25rem; line-height: 1.6; margin: 1rem 0 0; padding-left: 1.6rem; }
       .choices li { margin: 0.2rem 0; }
+      .kind { font-size: 1.05rem; color: #666; margin: 0.6rem 0 0; }
+      .fig { display: block; max-width: 100%; max-height: 50vh; margin-top: 0.8rem; border-radius: 6px; }
     `,
   ],
 })
 export class QuestionPanelComponent {
   constructor(public feed: SessionFeed) {}
+
+  describe(q: Question): string {
+    return describeKind(q);
+  }
 
   stageIsOpen(): boolean {
     const s = this.feed.stage();

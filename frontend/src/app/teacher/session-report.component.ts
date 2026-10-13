@@ -1,7 +1,8 @@
 import { Component, signal } from '@angular/core';
 
 import { ApiService } from '../api.service';
-import { Draw, Question } from '../models';
+import { Draw, Question, describeKind, kindOf } from '../models';
+import { ResultViewComponent } from '../shared/result-view.component';
 import { NameDrawComponent } from './name-draw.component';
 import { SessionFeed } from './session-feed.service';
 
@@ -22,7 +23,7 @@ import { SessionFeed } from './session-feed.service';
 @Component({
   selector: 'app-teacher-session-report',
   standalone: true,
-  imports: [NameDrawComponent],
+  imports: [NameDrawComponent, ResultViewComponent],
   template: `
     <div class="wrap">
       <div class="top">
@@ -64,6 +65,19 @@ import { SessionFeed } from './session-feed.service';
                 }
               </p>
             } @else {
+              @if (!isBars(q)) {
+                @if (describe(q)) { <p class="kind">{{ describe(q) }}</p> }
+                <app-result-view
+                  [question]="q"
+                  [pre]="feed.showPhase(q, 'pre') ? (c.pre_result ?? null) : null"
+                  [post]="feed.showPhase(q, 'post') ? (c.post_result ?? null) : null"
+                  [once]="feed.mode(q) === 'once'"
+                  [revealCorrect]="revealCorrect(q)"
+                  [teacher]="true"
+                  (hide)="hideAnswer($event)"
+                />
+              }
+              @if (isBars(q)) {
               <div class="hist">
                 @for (ch of q.choices; track ch.id) {
                   <div class="row" [class.correct]="revealCorrect(q) && ch.is_correct">
@@ -74,13 +88,13 @@ import { SessionFeed } from './session-feed.service';
                     <span class="bars">
                       @if (feed.showPhase(q, 'pre') && c.pre) {
                         <span class="line">
-                          <span class="bar pre" [style.width.%]="feed.pct(c.pre, ch.id, q)"></span>
+                          <span class="bar pre" [style.width.%]="feed.pct(c.pre, ch.id, q, c.pre_result?.total)"></span>
                           <span class="n">{{ c.pre[ch.id] || 0 }}</span>
                         </span>
                       }
                       @if (feed.showPhase(q, 'post') && c.post) {
                         <span class="line">
-                          <span class="bar post" [style.width.%]="feed.pct(c.post, ch.id, q)"></span>
+                          <span class="bar post" [style.width.%]="feed.pct(c.post, ch.id, q, c.post_result?.total)"></span>
                           <span class="n">{{ c.post[ch.id] || 0 }}</span>
                         </span>
                       }
@@ -88,16 +102,20 @@ import { SessionFeed } from './session-feed.service';
                   </div>
                 }
                 <p class="legend">
+                  @if (kindOf(q) === 'multi') { Choose all that apply: each bar is the share who ticked it. }
                   @if (feed.mode(q) === 'once') {
-                    <span class="sw pre"></span> answers ({{ feed.total(c.pre) }})
+                    <span class="sw pre"></span> answers ({{ c.pre_result?.total ?? feed.total(c.pre) }})
                   } @else {
                     <span class="sw pre"></span> before discussion
-                    ({{ feed.total(c.pre) }})
+                    ({{ c.pre_result?.total ?? feed.total(c.pre) }})
                     &nbsp;&nbsp;
                     <span class="sw post"></span> after discussion
-                    ({{ feed.total(c.post) }})
+                    ({{ c.post_result?.total ?? feed.total(c.post) }})
                   }
                 </p>
+              </div>
+              }
+              <div class="hist">
 
                 <!-- An anonymous session has no names to draw. -->
                 <div class="draw" [hidden]="feed.state()?.anonymous">
@@ -153,6 +171,7 @@ import { SessionFeed } from './session-feed.service';
       .ask { margin: 0.1rem 0 0; color: #555; }
       .nobody { color: #777; font-style: italic; }
       .empty { color: #777; }
+      .kind { font-size: 0.85rem; color: #777; margin: 0.2rem 0 0.4rem; }
       .error { color: #c0392b; }
     `,
   ],
@@ -166,6 +185,22 @@ export class TeacherSessionReportComponent {
   withAnswers = signal(true);
 
   constructor(public feed: SessionFeed, private api: ApiService) {}
+
+  readonly kindOf = kindOf;
+
+  /** Single- and several-choice results are bars with ticks; the rest draw themselves. */
+  isBars(q: Question): boolean {
+    return kindOf(q) === 'choice' || kindOf(q) === 'multi';
+  }
+
+  describe(q: Question): string {
+    return describeKind(q);
+  }
+
+  /** Take a text answer off the projected cards (and the phones), or put it back. */
+  hideAnswer(e: { id: number; hidden: boolean }): void {
+    this.api.hideAnswer(this.feed.code(), e.id, e.hidden).subscribe(() => this.feed.refreshComparisons());
+  }
 
   exportUrl(quizId: number, format: 'md' | 'html'): string {
     return this.api.quizExportUrl(quizId, format, this.withAnswers());

@@ -1,4 +1,5 @@
 import enum
+import json
 import secrets
 import string
 from datetime import datetime, timezone
@@ -51,6 +52,44 @@ class QuestionMode(str, enum.Enum):
     def phases(self) -> tuple["Phase", ...]:
         """The rounds this question is asked in."""
         return (Phase.pre,) if self is QuestionMode.once else (Phase.pre, Phase.post)
+
+
+class QuestionKind(str, enum.Enum):
+    """What a student gives as an answer, and so how the result is shown.
+
+    - `choice`: one of the choices. At most one is correct; none makes it a poll.
+    - `multi`: any number of the choices ("choose all that apply"). Any number
+      may be correct; the answer is right when it picks exactly those.
+    - `rank`: every choice, put in order. No right answer; the result is the
+      average rank of each choice.
+    - `number`: any number, optionally within `min`/`max`. Optionally right
+      within `tolerance` of `answer`. Shown as a histogram.
+    - `scale`: a whole number from `min` to `max` (e.g. 1-5), with labels for
+      the two ends. Shown as a bar per value.
+    - `word`: up to `max_words` short words or phrases. Shown as a word cloud.
+    - `text`: a few sentences. Shown as anonymous cards the teacher can hide.
+    - `point`: a tap on the question's figure (`image_url`). Shown as the taps
+      on the figure.
+
+    Choices belong to `choice`, `multi` and `rank` only.
+    """
+
+    choice = "choice"
+    multi = "multi"
+    rank = "rank"
+    number = "number"
+    scale = "scale"
+    word = "word"
+    text = "text"
+    point = "point"
+
+    @property
+    def has_choices(self) -> bool:
+        return self in (QuestionKind.choice, QuestionKind.multi, QuestionKind.rank)
+
+
+#: Settings that would give the answer away; never sent to students.
+SECRET_SETTINGS = ("answer", "tolerance")
 
 
 class User(Base):
@@ -161,11 +200,43 @@ class Question(Base):
         default=QuestionMode.twice,
         server_default=QuestionMode.twice.value,
     )
+    kind: Mapped[QuestionKind] = mapped_column(
+        Enum(QuestionKind, native_enum=False, length=16),
+        default=QuestionKind.choice,
+        server_default=QuestionKind.choice.value,
+    )
+    #: Per-kind settings as JSON (see `QuestionKind`): min, max, unit, answer,
+    #: tolerance, min_label, max_label, max_words, max_length.
+    settings: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     quiz: Mapped[Quiz] = relationship(back_populates="questions")
     choices: Mapped[list["Choice"]] = relationship(
         back_populates="question", order_by="Choice.position", cascade="all, delete-orphan"
     )
+
+    @property
+    def config(self) -> dict:
+        """`settings` as a dict; empty when none are set."""
+        return json.loads(self.settings) if self.settings else {}
+
+    @config.setter
+    def config(self, value: dict | None) -> None:
+        clean = {k: v for k, v in (value or {}).items() if v is not None and v != ""}
+        self.settings = json.dumps(clean, sort_keys=True) if clean else None
+
+    @property
+    def public_config(self) -> dict:
+        """The settings a student may see: without the answer."""
+        return {k: v for k, v in self.config.items() if k not in SECRET_SETTINGS}
+
+    @property
+    def graded(self) -> bool:
+        """Whether answers to this question can be right or wrong."""
+        if self.kind in (QuestionKind.choice, QuestionKind.multi):
+            return any(c.is_correct for c in self.choices)
+        if self.kind is QuestionKind.number:
+            return self.config.get("answer") is not None
+        return False
 
 
 class Choice(Base):
@@ -175,7 +246,8 @@ class Choice(Base):
     question_id: Mapped[int] = mapped_column(ForeignKey("questions.id"))
     position: Mapped[int] = mapped_column(default=0)
     text: Mapped[str] = mapped_column(Text)
-    # Exactly one choice per question is correct; enforced at the API layer.
+    # At most one for a `choice` question, any number for `multi`; none makes
+    # the question ungraded. Enforced at the API layer.
     is_correct: Mapped[bool] = mapped_column(Boolean, default=False)
 
     question: Mapped[Question] = relationship(back_populates="choices")
@@ -281,9 +353,23 @@ class Answer(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     round_id: Mapped[int] = mapped_column(ForeignKey("rounds.id"))
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
-    choice_id: Mapped[int] = mapped_column(ForeignKey("choices.id"))
+    #: The chosen choice of a `choice` question; None for every other kind.
+    choice_id: Mapped[int | None] = mapped_column(ForeignKey("choices.id"), nullable=True)
+    #: Every other kind's answer, as JSON: a list of choice ids (`multi`, and
+    #: `rank` in order), a number (`number`, `scale`), a list of words
+    #: (`word`), a string (`text`) or [x, y] in 0..1 (`point`).
+    value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: A `text` answer the teacher has taken off the projected results.
+    hidden: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
     submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     round: Mapped[Round] = relationship(back_populates="answers")
     user: Mapped[User] = relationship()
-    choice: Mapped[Choice] = relationship()
+    choice: Mapped[Choice | None] = relationship()
+
+    @property
+    def data(self):
+        """`value` decoded; None for a `choice` answer."""
+        return json.loads(self.value) if self.value is not None else None

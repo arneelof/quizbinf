@@ -23,7 +23,7 @@ from ..auth import (
 from ..config import Settings, get_settings
 from ..db import SessionLocal, get_db, writing
 from ..events import broadcaster
-from ..models import Answer, Choice, Phase, Question, QuestionMode, Quiz, QuizSession, User
+from ..models import Answer, Choice, Phase, Question, QuestionKind, QuestionMode, Quiz, QuizSession, User
 from ..public_base import public_base_url
 from ..schemas import (
     AnswerIn,
@@ -55,6 +55,7 @@ def _state(db: Session, session: QuizSession, user: User | None) -> SessionState
     open_round = service.get_open_round(db, session)
     question = open_round.question if open_round else None
     my_choice_id = None
+    my_answer = None
     if open_round and user:
         answer = db.scalar(
             select(Answer).where(
@@ -62,6 +63,7 @@ def _state(db: Session, session: QuizSession, user: User | None) -> SessionState
             )
         )
         my_choice_id = answer.choice_id if answer else None
+        my_answer = service.answer_out(answer)
 
     # Once a round is halted and nothing new has opened yet, students see the
     # same bar chart the teacher's Report view does — see SessionState's
@@ -70,6 +72,8 @@ def _state(db: Session, session: QuizSession, user: User | None) -> SessionState
     closed_round_question = None
     closed_round_histogram = None
     closed_round_pre_histogram = None
+    closed_round_result = None
+    closed_round_pre_result = None
     if open_round is None:
         closed_round = service.get_last_closed_round(db, session)
         if closed_round is not None:
@@ -82,10 +86,12 @@ def _state(db: Session, session: QuizSession, user: User | None) -> SessionState
                 pass
             else:
                 closed_round_histogram = service.round_histogram(db, closed_round)
+                closed_round_result = service.round_result(db, closed_round)
             if closed_round.phase == Phase.post:
                 pre = service.get_round(db, session, closed_round.question_id, Phase.pre)
                 if pre is not None:
                     closed_round_pre_histogram = service.round_histogram(db, pre)
+                    closed_round_pre_result = service.round_result(db, pre)
 
     return SessionState(
         code=session.code,
@@ -96,10 +102,13 @@ def _state(db: Session, session: QuizSession, user: User | None) -> SessionState
         open_round=RoundOut.model_validate(open_round) if open_round else None,
         question=question,
         my_choice_id=my_choice_id,
+        my_answer=my_answer,
         closed_round=RoundOut.model_validate(closed_round) if closed_round else None,
         closed_round_question=closed_round_question,
         closed_round_histogram=closed_round_histogram,
         closed_round_pre_histogram=closed_round_pre_histogram,
+        closed_round_result=closed_round_result,
+        closed_round_pre_result=closed_round_pre_result,
         anonymous=session.is_anonymous,
     )
 
@@ -376,7 +385,8 @@ def histogram(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Round not found")
     counts = service.round_histogram(db, round_)
     return HistogramOut(
-        round_id=round_.id, phase=round_.phase, counts=counts, total=sum(counts.values())
+        round_id=round_.id, phase=round_.phase, counts=counts, total=len(round_.answers),
+        result=service.round_result(db, round_, include_hidden=True),
     )
 
 
@@ -684,14 +694,46 @@ def submit_answer(
     round_ = service.get_open_round(db, session)
     if round_ is None:
         raise HTTPException(status.HTTP_409_CONFLICT, "No round is open")
-    choice = db.get(Choice, body.choice_id)
-    if choice is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Choice not found")
+    question = round_.question
+    choice = None
+    if question.kind is QuestionKind.choice:
+        choice = db.get(Choice, body.choice_id) if body.choice_id is not None else None
+        if choice is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Choice not found")
     try:
-        service.submit_answer(db, round_, user, choice)
+        _, value = service.answer_value(question, body)
+        service.submit_answer(db, round_, user, choice, value)
     except service.RuleViolation as e:
         raise HTTPException(status.HTTP_409_CONFLICT, str(e))
-    return {"ok": True, "choice_id": choice.id}
+    return {"ok": True, "choice_id": choice.id if choice else None}
+
+
+def _hide_answer_sync(db: Session, code: str, answer_id: int, hidden: bool, teacher: User) -> None:
+    session = _session_by_code(db, code)
+    if not access.can_manage(session.quiz, teacher):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your session")
+    try:
+        service.set_answer_hidden(db, session, answer_id, hidden)
+    except service.RuleViolation as e:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(e))
+
+
+@router.post("/{code}/answers/{answer_id}/hidden")
+async def hide_answer(
+    code: str,
+    answer_id: int,
+    hidden: bool = True,
+    db: Session = Depends(get_db),
+    teacher: User = Depends(current_teacher),
+) -> dict:
+    """Take a text answer off the projected results (`hidden=false` puts it back).
+
+    Students' phones follow: the broadcast state leaves hidden answers out. The
+    database work runs in a thread, as in `open_round`.
+    """
+    await run_in_threadpool(_hide_answer_sync, db, code, answer_id, hidden, teacher)
+    await _broadcast_state(code)
+    return {"ok": True, "hidden": hidden}
 
 
 def _join_session(code: str, user_id: int | None) -> str:

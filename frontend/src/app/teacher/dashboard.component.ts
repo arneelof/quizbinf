@@ -3,8 +3,21 @@ import { FormsModule } from '@angular/forms';
 import { Router } from '@angular/router';
 
 import { ApiService } from '../api.service';
-import { CanvasCourse, Question, Quiz, RosterStatus, SyncSummary } from '../models';
-import { QuestionDraft, QuestionEditorComponent } from './question-editor.component';
+import {
+  CanvasCourse,
+  Question,
+  Quiz,
+  RosterStatus,
+  SyncSummary,
+  describeKind,
+  numberAnswer,
+} from '../models';
+import {
+  QuestionDraft,
+  QuestionEditorComponent,
+  questionChoices,
+  questionSettings,
+} from './question-editor.component';
 
 @Component({
   selector: 'app-teacher-dashboard',
@@ -254,6 +267,7 @@ import { QuestionDraft, QuestionEditorComponent } from './question-editor.compon
                        the projector is being set up, and a highlighted
                        correct answer is exactly what must not be read from
                        the back of the room. Reveal it behind a click. -->
+                  @if (describe(q)) { <p class="kind">{{ describe(q) }}</p> }
                   <ul>
                     @for (c of q.choices; track c.id) {
                       <li [class.correct]="revealed()[q.id] && c.is_correct">
@@ -261,9 +275,12 @@ import { QuestionDraft, QuestionEditorComponent } from './question-editor.compon
                       </li>
                     }
                   </ul>
-                  <button type="button" class="reveal" (click)="toggleReveal(q.id)">
-                    {{ revealed()[q.id] ? 'Hide the answer' : 'Show which is correct' }}
-                  </button>
+                  @if (revealed()[q.id] && answerOf(q)) { <p class="kind correct">Answer: {{ answerOf(q) }}</p> }
+                  @if (q.graded !== false) {
+                    <button type="button" class="reveal" (click)="toggleReveal(q.id)">
+                      {{ revealed()[q.id] ? 'Hide the answer' : 'Show which is correct' }}
+                    </button>
+                  }
                   @if (deleteError()[q.id]; as msg) {
                     <p class="error">{{ msg }}</p>
                   }
@@ -319,6 +336,8 @@ import { QuestionDraft, QuestionEditorComponent } from './question-editor.compon
       .synced th, .synced td { border: 1px solid #ddd; padding: 0.2rem 0.5rem;
                                text-align: left; }
       .error { color: #c0392b; }
+      .kind { font-size: 0.85rem; color: #777; margin: 0.2rem 0; }
+      .kind.correct { color: #2c7a51; font-weight: 600; }
     `,
   ],
 })
@@ -357,6 +376,15 @@ export class TeacherDashboardComponent implements OnInit {
 
   constructor(private api: ApiService, private router: Router) {}
 
+  describe(q: Question): string {
+    return describeKind(q);
+  }
+
+  /** The right number, for a number question, once revealed. */
+  answerOf(q: Question): string {
+    return numberAnswer(q);
+  }
+
   ngOnInit(): void {
     this.reload();
     // Non-persistent storage does not announce itself: the app works until it
@@ -372,6 +400,9 @@ export class TeacherDashboardComponent implements OnInit {
     return {
       text: '',
       mode: 'twice',
+      kind: 'choice',
+      settings: {},
+      image_url: null,
       choices: [
         { text: '', is_correct: false },
         { text: '', is_correct: false },
@@ -471,6 +502,10 @@ export class TeacherDashboardComponent implements OnInit {
     this.editDraft = {
       text: q.text,
       mode: q.mode ?? 'twice',
+      kind: q.kind ?? 'choice',
+      settings: { ...(q.settings ?? {}) },
+      image_url: q.image_url,
+      no_answer: q.graded === false,
       choices: q.choices.map((c) => ({
         id: c.id,
         text: c.text,
@@ -493,9 +528,11 @@ export class TeacherDashboardComponent implements OnInit {
     this.api
       .editQuestion(quiz.id, id, {
         text: this.editDraft.text.trim(),
-        image_url: null,
-        choices: this.editDraft.choices.filter((c) => c.text.trim()),
+        image_url: this.editDraft.image_url,
+        choices: questionChoices(this.editDraft),
         mode: this.editDraft.mode,
+        kind: this.editDraft.kind,
+        settings: questionSettings(this.editDraft),
       })
       .subscribe({
         next: () => {
@@ -560,20 +597,24 @@ export class TeacherDashboardComponent implements OnInit {
 
   addQuestion(quiz: Quiz): void {
     this.formError = '';
-    const choices = this.draft.choices.filter((c) => c.text.trim());
     this.api
       .addQuestion(quiz.id, {
         text: this.draft.text.trim(),
-        image_url: null,
-        choices,
+        image_url: this.draft.image_url,
+        choices: questionChoices(this.draft),
         mode: this.draft.mode,
+        kind: this.draft.kind,
+        settings: questionSettings(this.draft),
       })
       .subscribe({
         next: () => {
           this.draft = this.blankDraft();
           this.reload();
         },
-        error: () => (this.formError = 'Could not save (need exactly one correct choice).'),
+        error: (err) =>
+          (this.formError = err?.error?.detail
+            ? `Could not save: ${typeof err.error.detail === 'string' ? err.error.detail : 'check the question.'}`
+            : 'Could not save the question.'),
       });
   }
 

@@ -16,7 +16,39 @@ so they load for a student reading the page in Canvas.
 import re
 
 from .markdown import render
-from .models import Quiz
+from .models import Question, QuestionKind, Quiz
+
+
+def describe(question: Question, answers: bool) -> str:
+    """One line saying what kind of answer is asked for, and the answer if
+    `answers` and there is one. Empty for a single-choice question."""
+    cfg = question.config
+    kind = question.kind
+    lo, hi = cfg.get("min"), cfg.get("max")
+    if kind is QuestionKind.multi:
+        return "Choose all that apply."
+    if kind is QuestionKind.rank:
+        return "Put these in order."
+    if kind is QuestionKind.scale:
+        lo, hi = lo if lo is not None else 1, hi if hi is not None else 5
+        ends = f" ({cfg.get('min_label', lo)} … {cfg.get('max_label', hi)})" if (
+            cfg.get("min_label") or cfg.get("max_label")) else ""
+        return f"On a scale from {lo:g} to {hi:g}{ends}."
+    if kind is QuestionKind.number:
+        unit = f" {cfg['unit']}" if cfg.get("unit") else ""
+        line = "Answer with a number" + (f" ({unit.strip()})" if unit else "") + "."
+        if answers and cfg.get("answer") is not None:
+            tol = f" ± {cfg['tolerance']:g}" if cfg.get("tolerance") else ""
+            line += f" Answer: {cfg['answer']:g}{tol}{unit}."
+        return line
+    if kind is QuestionKind.word:
+        n = cfg.get("max_words", 3)
+        return f"Answer with up to {n} word{'s' if n != 1 else ''}."
+    if kind is QuestionKind.text:
+        return "Answer in a few sentences."
+    if kind is QuestionKind.point:
+        return "Tap the place on the figure."
+    return ""
 
 # Only the app's own upload paths are made absolute. A link a teacher wrote to
 # somewhere else is already whatever they meant it to be.
@@ -40,7 +72,14 @@ def as_markdown(quiz: Quiz, base_url: str, answers: bool = True) -> str:
         lines.append("")
         lines.append(absolute_markdown(question.text, base_url))
         lines.append("")
+        if question.image_url:
+            lines.append(absolute_markdown(f"![]({question.image_url})", base_url))
+            lines.append("")
+        if describe(question, answers):
+            lines.append(f"*{describe(question, answers)}*")
+            lines.append("")
         for choice in question.choices:
+            # (Choices only exist for choice, multi and rank questions.)
             # A checked box for the right answer: it survives a paste into
             # anything that renders Markdown, and reads plainly where it does
             # not.
@@ -76,6 +115,12 @@ def as_html(quiz: Quiz, base_url: str, answers: bool = True) -> str:
     for question in quiz.questions:
         parts.append(f"<h2>{question.position + 1}.</h2>")
         parts.append(absolute_html(render(question.text), base_url))
+        if question.image_url:
+            parts.append(absolute_html(f'<p><img src="{_escape(question.image_url)}" alt=""></p>', base_url))
+        if describe(question, answers):
+            parts.append(f"<p><em>{_escape(describe(question, answers))}</em></p>")
+        if not question.choices:
+            continue
         parts.append("<ul>")
         for choice in question.choices:
             correct = answers and choice.is_correct
