@@ -207,6 +207,10 @@ import {
         <section class="quiz">
           <header>
             <h2>{{ quiz.title }}</h2>
+            <span class="quiz-actions">
+              <button type="button" class="small" (click)="renameQuiz(quiz)">Rename</button>
+              <button type="button" class="small danger" (click)="deleteQuiz(quiz)">Delete quiz</button>
+            </span>
             <span class="run">
               <button (click)="startSession(quiz)">Run session ▶</button>
               <button
@@ -219,6 +223,9 @@ import {
             </span>
           </header>
 
+          @if (quizError()[quiz.id]; as msg) {
+            <p class="error">{{ msg }}</p>
+          }
           @if (reorderError(); as msg) {
             <p class="error">{{ msg }}</p>
           }
@@ -319,6 +326,8 @@ import {
       .quiz { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
       header { display: flex; justify-content: space-between; align-items: center; }
       header .run { display: flex; gap: 0.4rem; }
+      header .quiz-actions { display: flex; gap: 0.3rem; margin-left: auto; margin-right: 0.8rem; }
+      header .quiz-actions .small { font-size: 0.8rem; padding: 0.2rem 0.5rem; }
       header .anon { background: #fff; color: #555; border: 1px solid #bbb; }
       li.correct { font-weight: 600; color: #2c7; }
       .reveal { font-size: 0.75rem; padding: 0.15rem 0.45rem; margin-top: 0.2rem;
@@ -576,6 +585,35 @@ export class TeacherDashboardComponent implements OnInit {
         this.reordering.set(false);
         this.reload();
       },
+    });
+  }
+
+  /** Errors from renaming or deleting a quiz, per quiz. */
+  quizError = signal<Record<number, string>>({});
+
+  renameQuiz(quiz: Quiz): void {
+    const title = prompt('New title for this quiz:', quiz.title)?.trim();
+    if (!title || title === quiz.title) return;
+    this.api.renameQuiz(quiz.id, title).subscribe({
+      next: () => this.setQuizError(quiz.id, ''),
+      error: (err) => this.setQuizError(quiz.id, err?.error?.detail ?? 'Could not rename the quiz.'),
+      complete: () => this.reload(),
+    });
+  }
+
+  /** Only a quiz no student has answered can go; the server refuses the rest. */
+  deleteQuiz(quiz: Quiz): void {
+    if (!confirm(`Delete the quiz "${quiz.title}" and all its questions? This cannot be undone.`)) return;
+    this.api.deleteQuiz(quiz.id).subscribe({
+      next: () => this.reload(),
+      error: (err) => this.setQuizError(quiz.id, err?.error?.detail ?? 'Could not delete the quiz.'),
+    });
+  }
+
+  private setQuizError(id: number, msg: string): void {
+    this.quizError.update((errors) => {
+      const { [id]: _dropped, ...rest } = errors;
+      return msg ? { ...rest, [id]: msg } : rest;
     });
   }
 

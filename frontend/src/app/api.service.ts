@@ -94,6 +94,12 @@ export class ApiService {
   createQuiz(title: string): Observable<Quiz> {
     return this.http.post<Quiz>(`${API_BASE}/api/quizzes`, { title }, this.opts);
   }
+  renameQuiz(id: number, title: string): Observable<Quiz> {
+    return this.http.patch<Quiz>(`${API_BASE}/api/quizzes/${id}`, { title }, this.opts);
+  }
+  deleteQuiz(id: number): Observable<void> {
+    return this.http.delete<void>(`${API_BASE}/api/quizzes/${id}`, this.opts);
+  }
   getQuiz(id: number): Observable<Quiz> {
     return this.http.get<Quiz>(`${API_BASE}/api/quizzes/${id}`, this.opts);
   }

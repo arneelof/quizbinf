@@ -1,14 +1,14 @@
 import re
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from .. import access, export, service
 from ..auth import current_teacher
 from ..config import Settings, get_settings
 from ..db import get_db, writing
-from ..models import Choice, Question, Quiz, User
+from ..models import Answer, Choice, Question, Quiz, QuizSession, Round, SessionParticipant, User
 from ..public_base import public_base_url
 from ..schemas import (
     QuestionEdit,
@@ -64,6 +64,47 @@ def get_quiz(
     quiz_id: int, db: Session = Depends(get_db), teacher: User = Depends(current_teacher)
 ) -> Quiz:
     return _own_quiz(db, quiz_id, teacher)
+
+
+@router.patch("/{quiz_id}", response_model=QuizOut)
+def rename_quiz(
+    quiz_id: int, body: QuizIn, db: Session = Depends(get_db), teacher: User = Depends(current_teacher)
+) -> Quiz:
+    """Rename a quiz. Titles stay unique, because the import scripts find quizzes by title."""
+    with writing(db):
+        quiz = _own_quiz(db, quiz_id, teacher)
+        clash = db.scalar(select(Quiz).where(Quiz.title == body.title, Quiz.id != quiz.id))
+        if clash is not None:
+            raise HTTPException(status.HTTP_409_CONFLICT, "Another quiz already has this title")
+        quiz.title = body.title
+        db.commit()
+        db.refresh(quiz)
+    return quiz
+
+
+@router.delete("/{quiz_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_quiz(
+    quiz_id: int, db: Session = Depends(get_db), teacher: User = Depends(current_teacher)
+) -> Response:
+    """Delete a quiz that no student has answered, with its (empty) sessions.
+
+    A quiz with answers is refused: they are attendance records."""
+    with writing(db):
+        quiz = _own_quiz(db, quiz_id, teacher)
+        answered = db.scalar(
+            select(func.count(Answer.id)).join(Round).join(QuizSession).where(QuizSession.quiz_id == quiz.id)
+        )
+        if answered:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"Students have given {answered} answers to this quiz; it cannot be deleted",
+            )
+        for session in db.scalars(select(QuizSession).where(QuizSession.quiz_id == quiz.id)):
+            db.execute(delete(SessionParticipant).where(SessionParticipant.session_id == session.id))
+            db.delete(session)
+        db.delete(quiz)
+        db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/{quiz_id}/export.md", include_in_schema=False)
