@@ -1,6 +1,7 @@
 import { Component, EventEmitter, Input, Output, signal } from '@angular/core';
 
 import { Question, RoundResult, kindOf, numberAnswer, scaleRange } from '../models';
+import { WordCloudComponent } from './word-cloud.component';
 
 interface Bin {
   label: string;
@@ -26,6 +27,7 @@ interface Bin {
 @Component({
   selector: 'app-result-view',
   standalone: true,
+  imports: [WordCloudComponent],
   template: `
     @switch (kind()) {
       @case ('scale') {
@@ -94,14 +96,11 @@ interface Bin {
       @case ('word') {
         @for (r of rounds(); track r.label) {
           @if (rounds().length > 1) { <p class="sub">{{ r.label }}</p> }
-          <div class="cloud">
-            @for (w of cloud(r.result); track w.word) {
-              <span class="word" [style.font-size.rem]="w.size" [style.color]="w.colour"
-                    [title]="w.count + ''">{{ w.word }}</span>
-            } @empty {
-              <span class="none">No answers.</span>
-            }
-          </div>
+          @if (r.result.words?.length) {
+            <app-word-cloud [words]="r.result.words ?? []" />
+          } @else {
+            <p class="none">No answers.</p>
+          }
         }
       }
 
@@ -211,10 +210,6 @@ interface Bin {
                 font-style: normal; font-size: 0.75rem; color: #555; }
       .tick { font-size: 0.72rem; color: #555; text-align: center; margin-top: 0.2rem; height: 1rem;
               white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-
-      .cloud { display: flex; flex-wrap: wrap; justify-content: center; align-items: center;
-               gap: 0.2rem 0.9rem; padding: 0.8rem; line-height: 1.15; }
-      .word { font-weight: 700; }
 
       .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr));
                gap: 0.6rem; margin-top: 0.4rem; }
@@ -344,26 +339,6 @@ export class ResultViewComponent {
     if (s.answer === undefined || s.answer === null) return false;
     const t = s.tolerance ?? 0;
     return b.lo <= s.answer + t && b.hi > s.answer - t;
-  }
-
-  // --- words ---
-
-  /**
-   * The words sized by count, biggest in the middle: they are placed
-   * alternately before and after the ones already there.
-   */
-  cloud(r: RoundResult): { word: string; count: number; size: number; colour: string }[] {
-    const words = (r.words ?? []).slice(0, 60);
-    const peak = Math.max(1, ...words.map((w) => w.count));
-    const colours = ['#1f6f8b', '#2c7a51', '#b5651d', '#7b3f8c', '#a23b3b', '#3d5a80'];
-    const sized = words.map((w, i) => ({
-      ...w,
-      size: 0.95 + 2.6 * Math.pow(w.count / peak, 0.7),
-      colour: colours[i % colours.length],
-    }));
-    const out: typeof sized = [];
-    sized.forEach((w, i) => (i % 2 ? out.unshift(w) : out.push(w)));
-    return out;
   }
 
   // --- text ---
