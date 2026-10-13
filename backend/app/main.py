@@ -17,7 +17,7 @@ from .config import VOLUME_ENV_FILE, get_settings
 from .db import Base, WriteQueueTimeout, engine, journal_mode, pool_stats, write_queue_stats
 from .diagnostics import dump_threads, storage_report
 from .events import broadcaster
-from .routers import auth, backup, images, markdown, quizzes, reports, roster, sessions
+from .routers import auth, backup, images, live, markdown, quizzes, reports, roster, sessions
 
 log = logging.getLogger("quizbinf")
 
@@ -288,6 +288,7 @@ async def renew_session_cookie(request: Request, call_next):
 app.include_router(auth.router)
 app.include_router(backup.router)
 app.include_router(images.router)
+app.include_router(live.router)
 app.include_router(markdown.router)
 app.include_router(quizzes.router)
 app.include_router(reports.router)
