@@ -29,6 +29,7 @@ import { AuthService } from './auth.service';
       } @else {
         <p>An in-class quiz for the bioinformatics course.</p>
         <p><a routerLink="/login">Sign in →</a></p>
+        <p><a routerLink="/demo">Try the demo, no login needed →</a></p>
       }
     </div>
   `,
