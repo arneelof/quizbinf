@@ -14,6 +14,11 @@ export const routes: Routes = [
       import('./student/session.component').then((m) => m.StudentSessionComponent),
   },
   {
+    // A public demo of the question kinds; runs in the browser, needs no login.
+    path: 'demo',
+    loadComponent: () => import('./demo/demo.component').then((m) => m.DemoComponent),
+  },
+  {
     path: 'teacher',
     canActivate: [teacherGuard],
     loadComponent: () =>
