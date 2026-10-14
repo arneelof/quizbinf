@@ -366,10 +366,16 @@ def participation_report(db: Session, session: QuizSession) -> list[dict]:
         key=lambda r: (r.question_id, r.phase.value),
     )
     correct_choice: dict[int, int | None] = {}
+    # A word cloud has no right answer: it is there to see who is present, so
+    # writing anything at all is a pass. Scoring it against a correct choice
+    # that does not exist marked every student who answered as wrong.
+    cloud: set[int] = set()
     for round_ in rounds:
         if round_.question_id not in correct_choice:
             correct = next((c for c in round_.question.choices if c.is_correct), None)
             correct_choice[round_.question_id] = correct.id if correct else None
+            if round_.question.kind is Kind.text:
+                cloud.add(round_.question_id)
 
     # user_id -> question_id -> phase -> chosen choice id
     chosen: dict[int, dict[int, dict[str, int]]] = {}
@@ -401,12 +407,18 @@ def participation_report(db: Session, session: QuizSession) -> list[dict]:
             def verdict(phase: str) -> bool | None:
                 if phase not in picks:
                     return None
+                if question_id in cloud:
+                    return True
                 return right is not None and picks[phase] == right
 
             pre, post = verdict("pre"), verdict("post")
             answered += sum(1 for v in (pre, post) if v is not None)
-            pre_correct += 1 if pre else 0
-            post_correct += 1 if post else 0
+            # A cloud's pass is presence, not knowledge: it stays out of the
+            # correctness totals, where it would make a student look worse
+            # after the discussion than before it.
+            if question_id not in cloud:
+                pre_correct += 1 if pre else 0
+                post_correct += 1 if post else 0
             per_question.append({"question_id": question_id, "pre": pre, "post": post})
         rows.append(
             {
