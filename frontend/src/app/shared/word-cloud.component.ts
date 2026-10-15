@@ -19,10 +19,13 @@ const FONT = 'system-ui, -apple-system, "Segoe UI", sans-serif';
 /**
  * A word cloud laid out with d3-cloud (https://github.com/jasondavies/d3-cloud):
  * the words are packed in a spiral around the centre, biggest first, sized by
- * how many students wrote them. Drawn as an SVG that scales with its box, so
- * the same layout serves the projector and a phone.
+ * how many students wrote them. Positions are only tried inside an ellipse, so
+ * the words pile up into an oval cloud instead of filling the rectangle, and
+ * about a third of the smaller words are turned on their side. Drawn as an SVG
+ * that scales with its box, so the same layout serves the projector and a phone.
  *
- * The layout uses a fixed random seed and is only redone when the words or
+ * The layout is deterministic (every word starts from the centre, and which
+ * words turn depends only on the word) and is only redone when the words or
  * counts change, so the cloud does not jump about while the results refresh.
  * If some words do not fit, it is redone with all words smaller.
  */
@@ -66,7 +69,7 @@ export class WordCloudComponent implements OnChanges, OnDestroy {
     const key = words.map((w) => `${w.word}:${w.count}`).join('|');
     if (key === this.key) return;
     this.key = key;
-    this.run(words, 1);
+    this.run(words, 1.3);
   }
 
   ngOnDestroy(): void {
@@ -85,20 +88,20 @@ export class WordCloudComponent implements OnChanges, OnDestroy {
     }
     const peak = Math.max(1, ...words.map((w) => w.count));
     // Few words may be big; many words must share the space.
-    const top = Math.min(110, 30 + 400 / Math.sqrt(words.length)) * scale;
+    const top = Math.min(130, 34 + 440 / Math.sqrt(words.length)) * scale;
+    const largest = 14 * scale + top;
     const counts = new Map(words.map((w) => [w.word, w.count]));
     const colour = new Map(words.map((w, i) => [w.word, COLOURS[i % COLOURS.length]]));
-    const random = seeded(1);
     const layout = cloud()
       .size([WIDTH, HEIGHT])
       .words(words.map((w) => ({ text: w.word, size: 14 * scale + top * Math.pow(w.count / peak, 0.7) })))
-      .padding(4)
-      .rotate(() => 0)
+      .padding(2)
+      .rotate((d) => ((d.size ?? 0) < 0.55 * largest && hash(d.text ?? '') % 3 === 0 ? -90 : 0))
       .font(FONT)
       .fontWeight('700')
       .fontSize((d) => d.size ?? 14)
-      .random(random)
-      .spiral('archimedean')
+      .random(() => 0.5) // every word starts from the centre, so the ellipse is centred
+      .spiral(ellipseSpiral(0.9))
       .on('end', (out) => {
         if (out.length < words.length && scale > 0.35) {
           this.run(words, scale * 0.85);
@@ -121,14 +124,34 @@ export class WordCloudComponent implements OnChanges, OnDestroy {
   }
 }
 
-/** A small seeded generator (mulberry32), so the same words give the same cloud. */
-function seeded(seed: number): () => number {
-  let a = seed >>> 0;
-  return () => {
-    a = (a + 0x6d2b79f5) >>> 0;
-    let t = a;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+/**
+ * d3-cloud's Archimedean spiral, cut to an ellipse that fills `fill` of the box: a point
+ * outside it is replaced by one far outside the box, which d3-cloud rejects, so words only
+ * land inside. The real point is returned once the spiral is past d3-cloud's limit, so the
+ * search for a word that does not fit still ends.
+ */
+function ellipseSpiral(fill: number): (size: [number, number]) => (t: number) => [number, number] {
+  return (size) => {
+    const e = size[0] / size[1];
+    const a = (size[0] / 2) * fill;
+    const b = (size[1] / 2) * fill;
+    const maxDelta = Math.sqrt(size[0] * size[0] + size[1] * size[1]);
+    return (t) => {
+      t *= 0.1;
+      const x = e * t * Math.cos(t);
+      const y = t * Math.sin(t);
+      if (Math.min(Math.abs(x), Math.abs(y)) >= maxDelta) return [x, y];
+      return (x * x) / (a * a) + (y * y) / (b * b) <= 1 ? [x, y] : [size[0] * 2, 0];
+    };
   };
+}
+
+/** A small string hash (FNV-1a), so that whether a word is turned depends only on the word. */
+function hash(s: string): number {
+  let h = 2166136261;
+  for (const c of s) {
+    h ^= c.codePointAt(0) ?? 0;
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
 }
