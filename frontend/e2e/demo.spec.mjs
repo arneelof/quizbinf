@@ -50,9 +50,14 @@ test('the demo runs every kind without logging in', async ({ page }) => {
   await shot('5-scale');
 
   await page.getByRole('button', { name: /^6\./ }).click();
-  await phone.locator('input.word').first().fill('backpropagation');
+  await phone.locator('input.word').first().fill('notation');
   await phone.getByRole('button', { name: 'Send' }).click();
-  await expect(projector.locator('.word', { hasText: /^backpropagation$/ })).toHaveCount(1);
+  await expect(projector.locator('.word', { hasText: /^notation$/ })).toHaveCount(1);
+  // A cloud, not a list of level words: some are turned on their side. A
+  // size-based rule turned none of the demo's words, which are mostly
+  // written more than once, unless the visitor's own answer happened to
+  // raise the top count ("backpropagation" did, so it hid the bug).
+  await expect(projector.locator('g[transform*="rotate(-90)"] .word').first()).toBeVisible();
   await shot('6-word');
 
   await page.getByRole('button', { name: /^7\./ }).click();

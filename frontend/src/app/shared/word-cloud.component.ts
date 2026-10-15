@@ -15,17 +15,21 @@ const WIDTH = 800;
 const HEIGHT = 420;
 const COLOURS = ['#1f6f8b', '#2c7a51', '#b5651d', '#7b3f8c', '#a23b3b', '#3d5a80'];
 const FONT = 'system-ui, -apple-system, "Segoe UI", sans-serif';
+/** How many of the most-written words are never turned on their side. */
+const LEVEL_WORDS = 3;
 
 /**
  * A word cloud laid out with d3-cloud (https://github.com/jasondavies/d3-cloud):
  * the words are packed in a spiral around the centre, biggest first, sized by
  * how many students wrote them. Positions are only tried inside an ellipse, so
  * the words pile up into an oval cloud instead of filling the rectangle, and
- * about a third of the smaller words are turned on their side. Drawn as an SVG
+ * about a third of the words after the biggest few are turned on their side.
+ * That is decided by rank, not by size: in a small class most words are
+ * written more than once, so a size threshold left every word horizontal. Drawn as an SVG
  * that scales with its box, so the same layout serves the projector and a phone.
  *
  * The layout is deterministic (every word starts from the centre, and which
- * words turn depends only on the word) and is only redone when the words or
+ * words turn depends only on the word and its rank) and is only redone when the words or
  * counts change, so the cloud does not jump about while the results refresh.
  * If some words do not fit, it is redone with all words smaller.
  */
@@ -87,16 +91,19 @@ export class WordCloudComponent implements OnChanges, OnDestroy {
       return;
     }
     const peak = Math.max(1, ...words.map((w) => w.count));
+    // The biggest few stay level, so the cloud's main words read at a glance.
+    const turned = new Set(
+      [...words].sort((a, b) => b.count - a.count).slice(LEVEL_WORDS).filter((w) => hash(w.word) % 3 === 0).map((w) => w.word),
+    );
     // Few words may be big; many words must share the space.
     const top = Math.min(130, 34 + 440 / Math.sqrt(words.length)) * scale;
-    const largest = 14 * scale + top;
     const counts = new Map(words.map((w) => [w.word, w.count]));
     const colour = new Map(words.map((w, i) => [w.word, COLOURS[i % COLOURS.length]]));
     const layout = cloud()
       .size([WIDTH, HEIGHT])
       .words(words.map((w) => ({ text: w.word, size: 14 * scale + top * Math.pow(w.count / peak, 0.7) })))
       .padding(2)
-      .rotate((d) => ((d.size ?? 0) < 0.55 * largest && hash(d.text ?? '') % 3 === 0 ? -90 : 0))
+      .rotate((d) => (turned.has(d.text ?? '') ? -90 : 0))
       .font(FONT)
       .fontWeight('700')
       .fontSize((d) => d.size ?? 14)
