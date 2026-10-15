@@ -95,6 +95,24 @@ Key product requirements:
   and the spin can always land.
 - **Pre/post pairing.** Every answer is stored with the round it belongs to
   (`pre` or `post`) so the two distributions can be compared per question.
+- **A word cloud is one of the question kinds** (`QuestionKind.word`, beside
+  `choice`, `multi`, `rank`, `number`, `scale`, `text` and `point`). It suits
+  the opening lecture — *what do you expect to learn?* — and has no right
+  answer. Students write up to `max_words` short words or phrases (default 3,
+  each cut to `WORD_LENGTH`, 40 characters), stored as a list in `Answer.data`.
+  Three properties carry over from the histogram, and should stay that way:
+  - **Nothing is projected while the window is open.** `/state` carries a
+    result only once no round is open, and the Report view shows a phase only
+    after it is halted (`showPhase`): a cloud filling in live tells the room
+    what to write, and puts whatever anybody types on the wall before the
+    teacher has seen it.
+  - **Counts only.** `round_result` returns words and how many wrote each,
+    never who.
+  - **It is a chance like any other.** Its rounds count in the attendance
+    files through the same `session_answering` as everything else.
+  Words are grouped case-insensitively and shown in the spelling most
+  students used, so a cloud is not split between "DNA" and "dna"; the inside
+  of a phrase is left alone, because "machine learning" is one answer.
 
 ## Architecture
 
