@@ -46,6 +46,12 @@ export const routes: Routes = [
           ),
       },
       {
+        // A competition's projected screen: question, clock, leaderboard, podium.
+        path: 'game',
+        loadComponent: () =>
+          import('./teacher/session-game.component').then((m) => m.TeacherSessionGameComponent),
+      },
+      {
         path: 'people',
         loadComponent: () =>
           import('./teacher/session-people.component').then(

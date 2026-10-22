@@ -23,19 +23,34 @@ from ..auth import (
 from ..config import Settings, get_settings
 from ..db import SessionLocal, get_db, writing
 from ..events import broadcaster
-from ..models import Answer, Choice, Phase, Question, QuestionKind, QuestionMode, Quiz, QuizSession, User
+from ..models import (
+    Answer,
+    Choice,
+    Phase,
+    Question,
+    QuestionKind,
+    QuestionMode,
+    Quiz,
+    QuizSession,
+    Round,
+    User,
+    utcnow,
+)
 from ..public_base import public_base_url
 from ..schemas import (
     AnswerIn,
     ComparisonOut,
     HistogramOut,
+    LeaderboardOut,
     LiveCountOut,
+    NicknameIn,
     OpenRoundIn,
     ParticipantsOut,
     ParticipationReportOut,
     RoundOut,
     SessionOut,
     SessionState,
+    StandingOut,
 )
 from .reports import CANVAS_STUDENT_COLUMNS, canvas_student_cells
 
@@ -79,7 +94,11 @@ def _state(db: Session, session: QuizSession, user: User | None) -> SessionState
         if closed_round is not None:
             closed_round_question = closed_round.question
             mode = closed_round_question.mode
-            if closed_round.phase == Phase.pre and mode == QuestionMode.twice_end:
+            if (
+                closed_round.phase == Phase.pre
+                and mode == QuestionMode.twice_end
+                and not session.is_competition
+            ):
                 # Discussion time: the round and question are sent so the
                 # student's page can say so, but the result stays hidden
                 # until the post round has been halted.
@@ -110,6 +129,14 @@ def _state(db: Session, session: QuizSession, user: User | None) -> SessionState
         closed_round_result=closed_round_result,
         closed_round_pre_result=closed_round_pre_result,
         anonymous=session.is_anonymous,
+        competition=session.is_competition,
+        time_limit=session.time_limit,
+        round_deadline=(
+            service.round_deadline(open_round)
+            if open_round is not None and session.is_competition
+            else None
+        ),
+        server_time=utcnow(),
     )
 
 
@@ -152,6 +179,10 @@ def create_session(
     quiz_id: int,
     loadtest: bool = False,
     anonymous: bool = False,
+    competition: bool = False,
+    time_limit: int | None = Query(
+        None, ge=service.TIME_LIMITS[0], le=service.TIME_LIMITS[1]
+    ),
     db: Session = Depends(get_db),
     teacher: User = Depends(current_teacher),
 ) -> QuizSession:
@@ -165,12 +196,22 @@ def create_session(
 
     `anonymous=true` lets students join without logging in and keeps their
     answers unlinked to them — see `QuizSession.is_anonymous`.
+
+    `competition=true` runs it as a Kahoot-style game: every question once,
+    `time_limit` seconds each (default 20), scored, with a leaderboard of
+    nicknames — see `QuizSession.is_competition`.
     """
     quiz = db.get(Quiz, quiz_id)
     if quiz is None or not access.can_manage(quiz, teacher):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Quiz not found")
     with writing(db):
-        session = QuizSession(quiz_id=quiz.id, is_loadtest=loadtest, is_anonymous=anonymous)
+        session = QuizSession(
+            quiz_id=quiz.id,
+            is_loadtest=loadtest,
+            is_anonymous=anonymous,
+            is_competition=competition,
+            time_limit=(time_limit or service.DEFAULT_TIME_LIMIT) if competition else None,
+        )
         db.add(session)
         db.commit()
         db.refresh(session)
@@ -273,14 +314,56 @@ async def open_round(
     lock, while the thread holding it waits for the event loop this coroutine
     is sitting on.
     """
-    round_ = await run_in_threadpool(_open_round_sync, db, code, body, teacher)
+    round_, time_limit = await run_in_threadpool(_open_round_sync, db, code, body, teacher)
     await _broadcast_state(code)
+    if time_limit is not None:
+        _schedule_auto_close(code, round_.id, time_limit + service.DEADLINE_GRACE)
     return round_
+
+
+#: Pending clock-outs, kept so the event loop does not drop them mid-sleep.
+_auto_close_tasks: set[asyncio.Task] = set()
+
+
+def _schedule_auto_close(code: str, round_id: int, seconds: float) -> None:
+    """Close a competition round when its clock runs out, and tell the room.
+
+    In memory, like the broadcaster, so it assumes the single replica the app
+    already does. If the process restarts mid-question the round simply stays
+    open until the teacher halts it — no answer is accepted after the deadline
+    either way, because `submit_answer` checks the clock itself.
+    """
+
+    async def run() -> None:
+        await asyncio.sleep(seconds)
+        if await run_in_threadpool(_auto_close_sync, round_id):
+            await _broadcast_state(code)
+
+    task = asyncio.create_task(run())
+    _auto_close_tasks.add(task)
+    task.add_done_callback(_auto_close_tasks.discard)
+
+
+def _auto_close_sync(round_id: int) -> bool:
+    """Close the round if it is still open; False if the teacher got there first."""
+    db = SessionLocal()
+    try:
+        round_ = db.get(Round, round_id)
+        if round_ is None or not round_.is_open:
+            db.commit()
+            return False
+        try:
+            service.close_round(db, round_)
+        except service.RuleViolation:
+            return False
+        return True
+    finally:
+        db.close()
 
 
 def _open_round_sync(
     db: Session, code: str, body: OpenRoundIn, teacher: User
-) -> RoundOut:
+) -> tuple[RoundOut, int | None]:
     session = _session_by_code(db, code)
     if not access.can_manage(session.quiz, teacher):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your session")
@@ -294,12 +377,13 @@ def _open_round_sync(
     # Serialised here rather than returned as an ORM object: FastAPI would
     # otherwise read its attributes on the event loop, which can lazy-load.
     out = RoundOut.model_validate(round_)
+    time_limit = (session.time_limit or service.DEFAULT_TIME_LIMIT) if session.is_competition else None
     # End the transaction before returning. The caller broadcasts next, which
     # needs a connection of its own, and a request still holding SQLite's
     # write lock would be waiting for itself — the rule `current_user`
     # already follows: never hold a transaction across a boundary.
     db.commit()
-    return out
+    return out, time_limit
 
 
 @router.post("/{code}/rounds/{round_id}/close", response_model=RoundOut)
@@ -628,6 +712,57 @@ def discussants(
     return {"names": names, "reel": service.reel_names(db, session, include=names)}
 
 
+def _competition(db: Session, code: str) -> QuizSession:
+    session = _session_by_code(db, code)
+    if not session.is_competition:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This session is not a competition")
+    return session
+
+
+@router.get("/{code}/leaderboard", response_model=LeaderboardOut)
+def leaderboard(
+    code: str,
+    db: Session = Depends(get_db),
+    teacher: User = Depends(current_teacher),
+) -> LeaderboardOut:
+    """The competition's ranking, for the projected screen.
+
+    Nicknames only — the names students chose to be projected under — and
+    only closed rounds count, so it never moves while a question is open.
+    Teacher-only all the same: the bottom of the table is nobody's business
+    but the teacher's, and the projected view shows the top of it.
+    """
+    session = _competition(db, code)
+    if not access.can_manage(session.quiz, teacher):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your session")
+    board = service.leaderboard(db, session)
+    return LeaderboardOut(
+        players=board["players"],
+        rounds_played=board["rounds_played"],
+        questions=len(session.quiz.questions),
+        last_question_id=board["last_question_id"],
+        entries=board["entries"],
+    )
+
+
+@router.delete("/{code}/players/{participant_id}/nickname")
+def clear_nickname(
+    code: str,
+    participant_id: int,
+    db: Session = Depends(get_db),
+    teacher: User = Depends(current_teacher),
+) -> dict:
+    """Take a nickname off the leaderboard; that student is asked for a new one."""
+    session = _competition(db, code)
+    if not access.can_manage(session.quiz, teacher):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your session")
+    try:
+        service.clear_nickname(db, session, participant_id)
+    except service.RuleViolation as e:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(e))
+    return {"ok": True}
+
+
 # --- student endpoints -----------------------------------------------------
 
 
@@ -706,6 +841,60 @@ def submit_answer(
     except service.RuleViolation as e:
         raise HTTPException(status.HTTP_409_CONFLICT, str(e))
     return {"ok": True, "choice_id": choice.id if choice else None}
+
+
+@router.put("/{code}/nickname")
+def set_nickname(
+    code: str,
+    body: NicknameIn,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    """Choose the name this student plays a competition under."""
+    session = _competition(db, code)
+    user = _member(request, response, db, settings, session)
+    if access.is_staff(session, user):
+        raise HTTPException(status.HTTP_409_CONFLICT, "Teachers do not play")
+    try:
+        nickname = service.set_nickname(db, session, user, body.nickname)
+    except service.RuleViolation as e:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(e))
+    return {"nickname": nickname}
+
+
+@router.get("/{code}/standing", response_model=StandingOut)
+def standing(
+    code: str,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> StandingOut:
+    """This student's own nickname, score and place — and nobody else's."""
+    session = _competition(db, code)
+    user = _member(request, response, db, settings, session)
+    nickname = service.nickname_of(db, session, user)
+    board = service.leaderboard(db, session)
+    mine = next((e for e in board["entries"] if e["user_id"] == user.id), None)
+    last_round_open = service.get_open_round(db, session) is not None
+    out = StandingOut(
+        nickname=nickname,
+        players=board["players"],
+        rounds_played=board["rounds_played"],
+        last_question_id=board["last_question_id"],
+    )
+    if mine is not None:
+        out.score = mine["score"]
+        out.rank = mine["rank"]
+        if not last_round_open and board["rounds_played"]:
+            out.last_points = mine["gained"]
+            out.last_correct = mine["last_correct"]
+            out.last_answered = mine["last_answered"]
+    # A read: end the transaction so the connection goes back to the pool.
+    db.commit()
+    return out
 
 
 def _hide_answer_sync(db: Session, code: str, answer_id: int, hidden: bool, teacher: User) -> None:

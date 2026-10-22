@@ -17,6 +17,9 @@ import { SessionFeed } from './session-feed.service';
   providers: [SessionFeed],
   template: `
     <nav class="views">
+      @if (feed.competition()) {
+        <a routerLink="game" routerLinkActive="active" class="game">🏆 Game</a>
+      }
       <a routerLink="join" routerLinkActive="active">Join</a>
       <a routerLink="control" routerLinkActive="active">Control</a>
       <a routerLink="report" routerLinkActive="active">Report</a>
@@ -46,6 +49,8 @@ import { SessionFeed } from './session-feed.service';
       .views a { padding: 0.4rem 0.9rem; border: 1px solid #ddd; border-radius: 6px;
                  text-decoration: none; color: inherit; }
       .views a.active { background: #2c7a51; color: #fff; border-color: #2c7a51; }
+      .views a.game { border-color: #46178f; color: #46178f; font-weight: 600; }
+      .views a.game.active { background: #46178f; color: #fff; }
       /* Flagged in the nav: unlike the others, this view must not be projected. */
       .views a.private { border-style: dashed; }
       .anon { padding: 0.4rem 0.9rem; border-radius: 6px; background: #eee; color: #555; }

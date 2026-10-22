@@ -471,6 +471,57 @@ session is excluded from `sessions_in_range` (so from both term reports),
 its participation report is empty, and the views that name students
 (`participation.csv`, the Canvas files, discussants) answer 409.
 
+## Competitions (Kahoot-style)
+
+A session started with `?competition=true&time_limit=N`
+(`QuizSession.is_competition`, the dashboard's *🏆 Competition* button) runs
+the same quiz as a game instead of as peer instruction. The projected screen
+is its own view, `/teacher/session/:code/game` (`session-game.component.ts`
+with `game-tiles`, `game-leaderboard` and `game-podium`), and the teacher
+drives it from that screen — *Start*, *Leaderboard*, *Next question*, or the
+space bar / → on a presentation clicker. The rules live in
+`service.py` under `# --- competitions`, pinned by `tests/test_competition.py`
+and `e2e/competition.spec.mjs`:
+
+- **Every question is asked once, against a clock.** Only a `pre` round can
+  be opened, whatever the question's own mode. The round carries a deadline
+  (`opened_at + time_limit`, default 20 s, 5–300 allowed); `submit_answer`
+  refuses anything later than that plus `DEADLINE_GRACE`, so the clock holds
+  even if nothing closes the round. `_schedule_auto_close` closes it and
+  broadcasts when the time is up — in memory, so a restart mid-question leaves
+  the round open until the teacher halts it, but still accepting nothing.
+- **The first answer counts.** A different second answer is refused
+  ("locked in"); the *same* answer again is accepted unchanged, because that
+  is a phone re-sending after a dropped connection, and its `submitted_at` —
+  which the points are computed from — is left alone.
+- **Points:** a right answer scores 1000 at once, falling linearly to 500 at
+  the buzzer; a wrong one or a question with no right answer scores 0.
+  `round_scores` caches each closed round, because the whole class asks for
+  its standing in the second after a question closes; `update_question`
+  clears the cache since an edit can change which answer is right.
+- **Nicknames, never names.** A student picks a nickname before they can
+  answer (`PUT /nickname`); it is unique within the session ignoring case,
+  at most 20 printable characters, and it is the only name a competition
+  projects. The real name stays on the Participants view. The teacher can
+  take a nickname down from the lobby (`DELETE /players/{id}/nickname`); the
+  student keeps their points and is asked for another.
+- **Nothing moves while the clock runs.** The leaderboard counts *closed*
+  rounds only, and the projected screen shows how many have answered, not
+  how. The right answer is marked once the round is closed — in a
+  competition that is the end of the question, so it is the same rule as
+  `revealCorrect()` elsewhere.
+- **A phone learns only its own standing** (`GET /standing`: nickname, score,
+  rank, how many players, and whether its last answer was right), and only
+  after the round has closed. It waits a random moment of up to 1.5 s before
+  asking, so a class does not arrive in the same instant. The full table
+  (`GET /leaderboard`) is teacher-only: the projected view shows the top five
+  and the podium, and the bottom of the table is nobody else's business.
+
+The clock on a phone is drawn from `round_deadline` and `server_time` in the
+state snapshot (`msLeft` in `models.ts`): the device only has to measure how
+much time has *passed* since the snapshot arrived, so a phone whose clock is
+wrong still counts down correctly — and the server decides regardless.
+
 ## Roster-checked identification (a stop-gap)
 
 Every real login route needs an administrator at KTH to grant something, and
@@ -959,6 +1010,11 @@ alembic upgrade head
 | `GET /api/quizzes/{id}/export.{md,html}?answers=` | teacher | the questions as study material, figures made absolute |
 | `DELETE /api/quizzes/{id}/questions/{qid}` | teacher | delete a question — **409 once it has been asked** |
 | `POST /api/sessions?quiz_id=&loadtest=` | teacher | start a lecture session; `loadtest=true` marks a rehearsal, kept out of every attendance report |
+| `POST /api/sessions?quiz_id=&competition=true&time_limit=` | teacher | start a **competition**: one timed round per question, scored, leaderboard of nicknames |
+| `GET /api/sessions/{code}/leaderboard` | teacher | competition ranking over closed rounds — **nicknames only** |
+| `DELETE /api/sessions/{code}/players/{id}/nickname` | teacher | take a nickname off the leaderboard; the student picks another |
+| `PUT /api/sessions/{code}/nickname` | student | choose the nickname to play a competition under |
+| `GET /api/sessions/{code}/standing` | student | own score, rank and last result in a competition — nobody else's |
 | `DELETE /api/sessions/{code}` | teacher | delete a **load-test** session and the throwaway students it made — **409 for a real one** |
 | `POST /api/auth/loadtest-login` | key holder | **rehearsal only:** sign in a throwaway student; off unless `LOADTEST_KEY` is set |
 | `GET /api/sessions/{code}/join-url` | teacher | the URL the QR code encodes |

@@ -14,6 +14,8 @@ import {
   LiveCount,
   Participants,
   ParticipationReport,
+  Leaderboard,
+  Standing,
   Phase,
   Question,
   QuestionEditInput,
@@ -209,13 +211,41 @@ export class ApiService {
 
   // --- teacher: sessions ---
   /** `anonymous`: students join without logging in; see the backend's `QuizSession.is_anonymous`. */
-  createSession(quizId: number, anonymous = false): Observable<QuizSession> {
-    const flag = anonymous ? '&anonymous=true' : '';
+  createSession(
+    quizId: number,
+    anonymous = false,
+    competition: { timeLimit: number } | null = null,
+  ): Observable<QuizSession> {
+    let flag = anonymous ? '&anonymous=true' : '';
+    if (competition) flag += `&competition=true&time_limit=${competition.timeLimit}`;
     return this.http.post<QuizSession>(
       `${API_BASE}/api/sessions?quiz_id=${quizId}${flag}`,
       {},
       this.opts,
     );
+  }
+  /** A competition's ranking — nicknames only. Teacher-only. */
+  leaderboard(code: string): Observable<Leaderboard> {
+    return this.http.get<Leaderboard>(`${API_BASE}/api/sessions/${code}/leaderboard`, this.opts);
+  }
+  /** Take a nickname off the leaderboard; that student is asked for another. */
+  clearNickname(code: string, participantId: number): Observable<unknown> {
+    return this.http.delete(
+      `${API_BASE}/api/sessions/${code}/players/${participantId}/nickname`,
+      this.opts,
+    );
+  }
+  /** Choose the name this student plays a competition under. */
+  setNickname(code: string, nickname: string): Observable<{ nickname: string }> {
+    return this.http.put<{ nickname: string }>(
+      `${API_BASE}/api/sessions/${code}/nickname`,
+      { nickname },
+      this.opts,
+    );
+  }
+  /** This student's own score and place in a competition. */
+  standing(code: string): Observable<Standing> {
+    return this.http.get<Standing>(`${API_BASE}/api/sessions/${code}/standing`, this.opts);
   }
   joinUrl(code: string): Observable<{ url: string }> {
     return this.http.get<{ url: string }>(`${API_BASE}/api/sessions/${code}/join-url`, this.opts);

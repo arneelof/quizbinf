@@ -16,6 +16,10 @@ answer.
   screen never shows the class how it voted before the discussion.
 - Results shown in class are aggregate only; individual answers are never
   exposed to other students.
+- **Competition mode** (Kahoot-style): every question once against a clock,
+  points for right and fast answers, and an animated leaderboard of
+  *nicknames* between questions, ending on a podium. Start it with
+  *🏆 Competition* on the dashboard; the projected screen is the *Game* view.
 
 ## Stack
 

@@ -220,6 +220,15 @@ import {
               >
                 Run anonymously
               </button>
+              <span class="game" title="Kahoot-style: every question once against the clock, points for right and fast answers, and a leaderboard of nicknames between questions.">
+                <button class="compete" (click)="startCompetition(quiz)">🏆 Competition</button>
+                <select [(ngModel)]="gameSeconds" [ngModelOptions]="{ standalone: true }"
+                        aria-label="Seconds per question">
+                  @for (s of gameSecondOptions; track s) {
+                    <option [ngValue]="s">{{ s }} s</option>
+                  }
+                </select>
+              </span>
             </span>
           </header>
 
@@ -329,6 +338,10 @@ import {
       header .quiz-actions { display: flex; gap: 0.3rem; margin-left: auto; margin-right: 0.8rem; }
       header .quiz-actions .small { font-size: 0.8rem; padding: 0.2rem 0.5rem; }
       header .anon { background: #fff; color: #555; border: 1px solid #bbb; }
+      header .game { display: inline-flex; border-radius: 6px; overflow: hidden;
+                     border: 1px solid #46178f; }
+      header .compete { background: #46178f; color: #fff; border: none; border-radius: 0; }
+      header .game select { border: none; background: #f1ebfa; color: #46178f; padding: 0 0.3rem; }
       li.correct { font-weight: 600; color: #2c7; }
       .reveal { font-size: 0.75rem; padding: 0.15rem 0.45rem; margin-top: 0.2rem;
                 color: #777; background: none; }
@@ -353,6 +366,9 @@ import {
 export class TeacherDashboardComponent implements OnInit {
   quizzes = signal<Quiz[]>([]);
   newTitle = '';
+  /** Seconds per question for a competition started from here. */
+  gameSeconds = 20;
+  readonly gameSecondOptions = [10, 20, 30, 60, 90];
   formError = '';
   reportFrom = '';
   reportTo = '';
@@ -654,6 +670,13 @@ export class TeacherDashboardComponent implements OnInit {
             ? `Could not save: ${typeof err.error.detail === 'string' ? err.error.detail : 'check the question.'}`
             : 'Could not save the question.'),
       });
+  }
+
+  /** A Kahoot-style run: straight to the projected game screen. */
+  startCompetition(quiz: Quiz): void {
+    this.api.createSession(quiz.id, false, { timeLimit: this.gameSeconds }).subscribe((s) => {
+      this.router.navigate(['/teacher/session', s.code, 'game']);
+    });
   }
 
   startSession(quiz: Quiz, anonymous = false): void {

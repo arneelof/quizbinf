@@ -290,6 +290,16 @@ class QuizSession(Base):
         Boolean, nullable=False, default=False, server_default=false()
     )
 
+    #: A Kahoot-style game rather than peer instruction. Every question is
+    #: asked once, against a clock of `time_limit` seconds; a right answer
+    #: scores more the faster it came, and a leaderboard of *nicknames* is
+    #: projected between questions. See `service.leaderboard`.
+    is_competition: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    #: Seconds each question stays open in a competition; None otherwise.
+    time_limit: Mapped[int | None] = mapped_column(nullable=True)
+
     quiz: Mapped[Quiz] = relationship()
     rounds: Mapped[list["Round"]] = relationship(
         back_populates="session", cascade="all, delete-orphan"
@@ -339,6 +349,10 @@ class SessionParticipant(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    #: What a competition's leaderboard calls this student. Chosen by the
+    #: student, unique within the session, and the only name a competition
+    #: ever projects: the real one stays on the teacher-only Participants view.
+    nickname: Mapped[str | None] = mapped_column(String(24), nullable=True)
 
     session: Mapped[QuizSession] = relationship()
     user: Mapped[User] = relationship()

@@ -194,6 +194,78 @@ export interface SessionState {
   /** The same rounds as RoundResult, for every kind; hidden text answers left out. */
   closed_round_result?: RoundResult | null;
   closed_round_pre_result?: RoundResult | null;
+  /**
+   * A Kahoot-style competition: every question once, against a clock, with a
+   * leaderboard of nicknames. `round_deadline` is when the open round's clock
+   * runs out and `server_time` when the snapshot was taken, so a countdown can
+   * be drawn without trusting this device's clock.
+   */
+  competition?: boolean;
+  time_limit?: number | null;
+  round_deadline?: string | null;
+  server_time?: string | null;
+}
+
+/** One row of a competition's projected ranking: a nickname, never a name. */
+export interface LeaderboardEntry {
+  participant_id: number;
+  nickname: string;
+  score: number;
+  /** What the most recently closed question earned. */
+  gained: number;
+  rank: number;
+  /** Where the player stood before that question; null after the first. */
+  previous_rank: number | null;
+  last_correct: boolean | null;
+}
+
+export interface Leaderboard {
+  players: number;
+  rounds_played: number;
+  questions: number;
+  last_question_id: number | null;
+  entries: LeaderboardEntry[];
+}
+
+/** A student's own place in a competition, for their phone. */
+export interface Standing {
+  nickname: string | null;
+  score: number;
+  rank: number | null;
+  players: number;
+  rounds_played: number;
+  last_question_id: number | null;
+  last_points: number | null;
+  last_correct: boolean | null;
+  /** Whether they answered the last question at all. */
+  last_answered: boolean | null;
+}
+
+/** Kahoot's four colours and shapes, cycled for questions with more choices. */
+export const GAME_TILES = [
+  { color: '#e21b3c', shape: '▲' },
+  { color: '#1368ce', shape: '◆' },
+  { color: '#d89e00', shape: '●' },
+  { color: '#26890c', shape: '■' },
+  { color: '#864cbf', shape: '★' },
+  { color: '#0aa3a3', shape: '⬟' },
+] as const;
+
+export function gameTile(index: number): { color: string; shape: string } {
+  return GAME_TILES[index % GAME_TILES.length];
+}
+
+/**
+ * Milliseconds left on the open round's clock, by the server's reckoning.
+ *
+ * `receivedAt` is when this device got the snapshot: the server's own
+ * "time left" at that moment is carried forward on this device's clock, which
+ * only has to be right about how much time has *passed*, not what time it is.
+ */
+export function msLeft(state: SessionState | null, receivedAt: number, now = Date.now()): number {
+  if (!state?.round_deadline || !state.server_time) return 0;
+  const left = Date.parse(state.round_deadline) - Date.parse(state.server_time);
+  return Math.max(0, left - (now - receivedAt));
 }
 
 export interface Histogram {
@@ -262,6 +334,8 @@ export interface QuizSession {
   quiz_id: number;
   created_at: string;
   is_anonymous?: boolean;
+  is_competition?: boolean;
+  time_limit?: number | null;
 }
 
 // Payload shapes for creating a question (no server-assigned ids yet).

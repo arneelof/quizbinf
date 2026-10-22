@@ -78,7 +78,9 @@ def open_round(db: Session, session: QuizSession, question: Question, phase: Pha
     )
     if existing is not None:
         raise RuleViolation(f"The {phase.value} round for this question was already run")
-    if phase not in question.mode.phases:
+    if session.is_competition and phase != Phase.pre:
+        raise RuleViolation("In a competition every question is asked once")
+    if not session.is_competition and phase not in question.mode.phases:
         raise RuleViolation("This question is asked only once")
     if phase == Phase.post:
         pre = db.scalar(
@@ -274,13 +276,27 @@ def submit_answer(
         raise RuleViolation("No answer given")
     choice_id = choice.id if choice is not None else None
     stored = json.dumps(value) if value is not None else None
+    competition = round_.session.is_competition
+    if competition and nickname_of(db, round_.session, user) is None:
+        raise RuleViolation("Choose a nickname first")
     for attempt in range(2):
         db.refresh(round_, with_for_update={"read": True})
         if not round_.is_open:
             raise RuleViolation("This round is closed")
+        if competition and utcnow() > round_deadline(round_) + timedelta(seconds=DEADLINE_GRACE):
+            raise RuleViolation("Time is up")
         answer = db.scalar(
             select(Answer).where(Answer.round_id == round_.id, Answer.user_id == user.id)
         )
+        if answer is not None and competition:
+            # The first answer counts, as in Kahoot: changing it after seeing
+            # what the room is doing would make speed meaningless. A phone
+            # re-sending the same answer after a dropped connection is not a
+            # change, so it is accepted without touching the timestamp the
+            # points are computed from.
+            if answer.choice_id == choice_id and answer.value == stored:
+                return answer
+            raise RuleViolation("Your answer is locked in")
         if answer is None:
             answer = Answer(round_id=round_.id, user_id=user.id, choice_id=choice_id, value=stored)
             db.add(answer)
@@ -1210,6 +1226,8 @@ def update_question(
 
     db.commit()
     db.refresh(question)
+    # Which answer is right may have changed, and competition scores with it.
+    _ROUND_SCORES.clear()
     return question
 
 
@@ -1452,3 +1470,206 @@ def pre_post_comparison(db: Session, session: QuizSession, question: Question) -
             result[round_.phase.value] = round_histogram(db, round_)
             result[f"{round_.phase.value}_result"] = round_result(db, round_, include_hidden=True)
     return result
+
+
+# --- competitions ----------------------------------------------------------
+#
+# A competition is the same session machinery run as a game: each question is
+# one timed round, a right answer earns points that fall with the time taken,
+# and between questions a leaderboard of *nicknames* is projected. Real names
+# never appear: the nickname is the student's own choice, and the Participants
+# view stays the one place that links it to a person.
+
+#: Seconds a competition question stays open unless the session says otherwise.
+DEFAULT_TIME_LIMIT = 20
+TIME_LIMITS = (5, 300)
+#: Answers are accepted this long after the clock runs out: the countdown a
+#: phone shows is the server's, but the tap still has to travel.
+DEADLINE_GRACE = 1.5
+#: Points for a right answer: the full amount at once, half of it at the buzzer.
+MAX_POINTS = 1000
+MIN_POINTS = 500
+NICKNAME_LENGTH = 20
+
+
+def round_deadline(round_: Round) -> datetime:
+    """When a competition round's clock runs out."""
+    limit = round_.session.time_limit or DEFAULT_TIME_LIMIT
+    return _as_utc(round_.opened_at) + timedelta(seconds=limit)
+
+
+def answer_points(round_: Round, answer: Answer) -> int:
+    """What one answer scores: nothing unless it is right, then more the faster.
+
+    A question with no right answer (a poll, a word cloud) scores nothing for
+    anyone, so it can sit in a competition without deciding it.
+    """
+    if not is_correct(round_.question, answer):
+        return 0
+    limit = round_.session.time_limit or DEFAULT_TIME_LIMIT
+    taken = (_as_utc(answer.submitted_at) - _as_utc(round_.opened_at)).total_seconds()
+    fraction = min(max(taken / limit, 0.0), 1.0)
+    return round(MAX_POINTS - (MAX_POINTS - MIN_POINTS) * fraction)
+
+
+#: Each closed round's points per user, by (round id, closed_at). A closed
+#: round's answers cannot change, and when a whole class asks for its standing
+#: in the same second after a question closes, re-scoring every answer of the
+#: session once per phone is the part worth not repeating. Editing a question
+#: can change which answer is right, so `update_question` empties it.
+_ROUND_SCORES: dict[tuple[int, str], dict[int, tuple[int, bool | None]]] = {}
+
+
+def round_scores(round_: Round) -> dict[int, tuple[int, bool | None]]:
+    """user id -> (points, right or wrong) for one closed round."""
+    key = (round_.id, _as_utc(round_.closed_at).isoformat())
+    cached = _ROUND_SCORES.get(key)
+    if cached is None:
+        cached = {
+            a.user_id: (answer_points(round_, a), is_correct(round_.question, a))
+            for a in round_.answers
+        }
+        if len(_ROUND_SCORES) > 2000:
+            _ROUND_SCORES.clear()
+        _ROUND_SCORES[key] = cached
+    return cached
+
+
+def clean_nickname(raw: str) -> str:
+    """A nickname as it will be projected: trimmed, single-spaced, printable."""
+    text = "".join(ch for ch in (raw or "") if ch.isprintable())
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        raise RuleViolation("Choose a nickname")
+    if len(text) > NICKNAME_LENGTH:
+        raise RuleViolation(f"A nickname can be at most {NICKNAME_LENGTH} characters")
+    return text
+
+
+def nickname_of(db: Session, session: QuizSession, user: User) -> str | None:
+    return db.scalar(
+        select(SessionParticipant.nickname).where(
+            SessionParticipant.session_id == session.id,
+            SessionParticipant.user_id == user.id,
+        )
+    )
+
+
+@write_path
+def set_nickname(db: Session, session: QuizSession, user: User, raw: str) -> str:
+    """Give `user` a nickname in this competition, unique within it.
+
+    Case-insensitively unique, so the leaderboard never shows two "Alice"s
+    that the room cannot tell apart. A student may change theirs; their score
+    goes with them, since it belongs to the participant, not the name.
+    """
+    if not session.is_competition:
+        raise RuleViolation("Nicknames are only used in competitions")
+    nickname = clean_nickname(raw)
+    taken = db.scalar(
+        select(SessionParticipant.id).where(
+            SessionParticipant.session_id == session.id,
+            SessionParticipant.user_id != user.id,
+            func.lower(SessionParticipant.nickname) == nickname.lower(),
+        )
+    )
+    if taken is not None:
+        raise RuleViolation("That nickname is taken — pick another")
+    participant = db.scalar(
+        select(SessionParticipant).where(
+            SessionParticipant.session_id == session.id,
+            SessionParticipant.user_id == user.id,
+        )
+    )
+    if participant is None:
+        participant = SessionParticipant(session_id=session.id, user_id=user.id)
+        db.add(participant)
+    participant.nickname = nickname
+    db.commit()
+    return nickname
+
+
+@write_path
+def clear_nickname(db: Session, session: QuizSession, participant_id: int) -> None:
+    """Take a nickname off the leaderboard; the student is asked for another.
+
+    For the one the teacher would rather the room did not read. The points
+    stay with the student, who reappears under whatever they pick next.
+    """
+    participant = db.get(SessionParticipant, participant_id)
+    if participant is None or participant.session_id != session.id:
+        raise RuleViolation("No such player in this session")
+    participant.nickname = None
+    db.commit()
+
+
+def leaderboard(db: Session, session: QuizSession) -> dict:
+    """Every player's score over the closed rounds, ranked.
+
+    Only *closed* rounds count, so nothing here moves while a question is
+    being answered — the leaderboard can be projected at any time without
+    giving away how the room is voting. Each entry also says where the player
+    stood before the most recent round and what that round earned them, which
+    is what the projected view animates.
+
+    Ties share a rank (1, 1, 3), and are listed alphabetically.
+    """
+    players = db.execute(
+        select(SessionParticipant.id, SessionParticipant.user_id, SessionParticipant.nickname)
+        .where(
+            SessionParticipant.session_id == session.id,
+            SessionParticipant.nickname.is_not(None),
+        )
+    ).all()
+    rounds = sorted(
+        (r for r in session.rounds if not r.is_open),
+        key=lambda r: _as_utc(r.closed_at),
+    )
+    total: Counter = Counter()
+    before: Counter = Counter()
+    last_gain: Counter = Counter()
+    last_correct: dict[int, bool | None] = {}
+    for i, round_ in enumerate(rounds):
+        is_last = i == len(rounds) - 1
+        for user_id, (points, correct) in round_scores(round_).items():
+            total[user_id] += points
+            if is_last:
+                last_gain[user_id] = points
+                last_correct[user_id] = correct
+            else:
+                before[user_id] += points
+
+    def ranked(scores: Counter) -> dict[int, int]:
+        order = sorted(players, key=lambda p: (-scores[p.user_id], p.nickname.lower()))
+        ranks: dict[int, int] = {}
+        for position, p in enumerate(order, start=1):
+            previous = order[position - 2] if position > 1 else None
+            if previous is not None and scores[previous.user_id] == scores[p.user_id]:
+                ranks[p.user_id] = ranks[previous.user_id]
+            else:
+                ranks[p.user_id] = position
+        return ranks
+
+    now_rank = ranked(total)
+    prev_rank = ranked(before)
+    entries = [
+        {
+            "participant_id": p.id,
+            "user_id": p.user_id,
+            "nickname": p.nickname,
+            "score": total[p.user_id],
+            "gained": last_gain[p.user_id],
+            "rank": now_rank[p.user_id],
+            "previous_rank": prev_rank[p.user_id] if len(rounds) > 1 else None,
+            "last_correct": last_correct.get(p.user_id),
+            "last_answered": p.user_id in last_correct,
+        }
+        for p in players
+    ]
+    entries.sort(key=lambda e: (e["rank"], e["nickname"].lower()))
+    return {
+        "players": len(entries),
+        "rounds_played": len(rounds),
+        "last_question_id": rounds[-1].question_id if rounds else None,
+        "entries": entries,
+    }

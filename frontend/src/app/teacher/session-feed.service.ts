@@ -13,6 +13,8 @@ import { Comparison, Phase, Question, QuestionMode, Round, SessionState } from '
 export class SessionFeed implements OnDestroy {
   readonly code = signal('');
   readonly state = signal<SessionState | null>(null);
+  /** When `state` arrived on this device, for counting down a competition's clock. */
+  readonly receivedAt = signal(0);
   readonly questions = signal<Question[]>([]);
   readonly comparisons = signal<Record<number, Comparison>>({});
   readonly joinUrl = signal('');
@@ -31,7 +33,7 @@ export class SessionFeed implements OnDestroy {
     });
     this.refreshState();
     this.teardown = this.api.streamState(code, (s) => {
-      this.state.set(s);
+      this.setState(s);
       this.loadQuestions();
       this.refreshComparisons();
     });
@@ -44,11 +46,21 @@ export class SessionFeed implements OnDestroy {
   refreshState(): void {
     this.api.sessionState(this.code()).subscribe({
       next: (s) => {
-        this.state.set(s);
+        this.setState(s);
         this.loadQuestions();
       },
       error: () => this.error.set('Session not found.'),
     });
+  }
+
+  private setState(s: SessionState): void {
+    this.receivedAt.set(Date.now());
+    this.state.set(s);
+  }
+
+  /** A Kahoot-style game rather than peer instruction. */
+  competition(): boolean {
+    return !!this.state()?.competition;
   }
 
   private loadQuestions(): void {
@@ -103,6 +115,8 @@ export class SessionFeed implements OnDestroy {
   }
 
   mode(q: Question): QuestionMode {
+    // A competition asks every question once, whatever it was written for.
+    if (this.competition()) return 'once';
     return q.mode ?? 'twice';
   }
 

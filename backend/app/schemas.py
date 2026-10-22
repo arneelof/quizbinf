@@ -196,6 +196,8 @@ class SessionOut(BaseModel):
     quiz_id: int
     created_at: datetime
     is_anonymous: bool = False
+    is_competition: bool = False
+    time_limit: int | None = None
 
 
 class OpenRoundIn(BaseModel):
@@ -257,6 +259,14 @@ class SessionState(BaseModel):
     # Hidden text answers are left out: this is what students see.
     closed_round_result: dict | None = None
     closed_round_pre_result: dict | None = None
+    # A Kahoot-style competition: one timed round per question, scored, with
+    # a leaderboard of nicknames. `round_deadline` is when the open round's
+    # clock runs out, and `server_time` when this snapshot was taken, so a
+    # phone can count down without trusting its own clock.
+    competition: bool = False
+    time_limit: int | None = None
+    round_deadline: datetime | None = None
+    server_time: datetime | None = None
 
 
 class HistogramOut(BaseModel):
@@ -314,3 +324,49 @@ class LiveCountOut(BaseModel):
 
     open_round: RoundOut | None
     answered: int
+
+
+class NicknameIn(BaseModel):
+    nickname: str = Field(max_length=200)
+
+
+class StandingOut(BaseModel):
+    """One student's own place in a competition, for their phone.
+
+    Their own score, rank and last result only — never anyone else's, beyond
+    the number of players. `last_*` describe the most recently closed round,
+    and are absent while a round is open so a phone cannot tell its owner
+    whether they are right before the clock runs out.
+    """
+
+    nickname: str | None
+    score: int = 0
+    rank: int | None = None
+    players: int = 0
+    rounds_played: int = 0
+    last_question_id: int | None = None
+    last_points: int | None = None
+    last_correct: bool | None = None
+    #: Whether they answered the last question at all — a wrong answer and no
+    #: answer both score nothing, and the phone says which.
+    last_answered: bool | None = None
+
+
+class LeaderboardEntry(BaseModel):
+    participant_id: int
+    nickname: str
+    score: int
+    gained: int
+    rank: int
+    previous_rank: int | None
+    last_correct: bool | None
+
+
+class LeaderboardOut(BaseModel):
+    """The projected ranking: nicknames and points, never real names."""
+
+    players: int
+    rounds_played: int
+    questions: int
+    last_question_id: int | None
+    entries: list[LeaderboardEntry]

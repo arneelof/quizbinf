@@ -8,13 +8,29 @@ import {
   Question,
   QuestionKind,
   SessionState,
+  Standing,
   kindOf,
+  msLeft,
   scaleRange,
 } from '../models';
 import { ResultViewComponent } from '../shared/result-view.component';
+import {
+  AnswerTilesComponent,
+  CountdownBarComponent,
+  GameVerdictComponent,
+  NicknameFormComponent,
+} from './competition.components';
 
 /** How many times a phone re-sends an answer the server was too busy to take. */
 const SEND_RETRIES = 3;
+/**
+ * A competition's whole class asks for its standing the moment a question
+ * closes; each phone waits up to this long first, so they do not all arrive
+ * in the same instant.
+ */
+const STANDING_SPREAD_MS = 1500;
+/** How often the phone's countdown redraws. */
+const CLOCK_TICK_MS = 250;
 /** The first wait, doubled each attempt and jittered — see `answer()`. */
 const SEND_BACKOFF_MS = 400;
 /**
@@ -27,7 +43,13 @@ const RETRYABLE_STATUSES = [0, 502, 503, 504];
 @Component({
   selector: 'app-student-session',
   standalone: true,
-  imports: [ResultViewComponent],
+  imports: [
+    ResultViewComponent,
+    AnswerTilesComponent,
+    CountdownBarComponent,
+    GameVerdictComponent,
+    NicknameFormComponent,
+  ],
   template: `
     <div class="wrap">
       @if (state(); as s) {
@@ -35,11 +57,19 @@ const RETRYABLE_STATUSES = [0, 502, 503, 504];
         @if (s.anonymous) {
           <p class="anon">Anonymous — your answers are not linked to you.</p>
         }
+        @if (s.competition && standing()?.nickname; as nick) {
+          <p class="anon">🏆 Playing as <strong>{{ nick }}</strong></p>
+        }
 
-        @if (s.open_round && s.question) {
+        @if (s.competition && standingLoaded() && (!standing()?.nickname || renaming())) {
+          <app-nickname-form [current]="standing()?.nickname ?? null" [error]="nicknameError()"
+                             [busy]="nicknameBusy()" (chosen)="chooseNickname($event)" />
+        } @else if (s.open_round && s.question) {
           <p class="phase">
             {{
-              s.question.mode === 'once'
+              s.competition
+                ? 'Question'
+                : s.question.mode === 'once'
                 ? 'Answer'
                 : s.open_round.phase === 'pre'
                   ? 'First answer'
@@ -50,6 +80,14 @@ const RETRYABLE_STATUSES = [0, 502, 503, 504];
           @if (s.question.image_url && kind(s.question) !== 'point') {
             <img [src]="s.question.image_url" alt="" />
           }
+          @if (s.competition) {
+            <app-countdown-bar [msLeft]="clockLeft()" [limitSeconds]="s.time_limit ?? 20" />
+          }
+          @if (s.competition && kind(s.question) === 'choice') {
+            <app-answer-tiles [choices]="s.question.choices" [picked]="selected()"
+                              [locked]="selected() !== null || sending() || clockLeft() === 0"
+                              (pick)="answer($event)" />
+          } @else {
           @switch (kind(s.question)) {
             @case ('choice') {
               <div class="choices">
@@ -139,12 +177,26 @@ const RETRYABLE_STATUSES = [0, 502, 503, 504];
               </div>
             }
           }
+          }
           @if (sending()) {
             <p class="sending">Sending…</p>
           } @else if (sendError()) {
             <p class="error">{{ sendError() }}</p>
+          } @else if (saved() && s.competition) {
+            <p class="saved">Locked in! Watch the big screen. 🤞</p>
           } @else if (saved()) {
             <p class="saved">Answer saved — you can change it while the question is open.</p>
+          } @else if (s.competition && clockLeft() === 0) {
+            <p class="error">Time's up!</p>
+          }
+        } @else if (s.competition) {
+          @if (s.closed_round) {
+            <app-game-verdict [standing]="standingRound() === s.closed_round.id ? standing() : null" />
+          } @else {
+            <p class="waiting">You're in! Watch the big screen — the game starts soon.</p>
+          }
+          @if (standing()?.nickname) {
+            <p class="rename"><button type="button" (click)="renaming.set(true)">Change nickname</button></p>
           }
         } @else {
           @if (s.closed_round_result && s.closed_round_question && !isBars(s.closed_round_question)) {
@@ -220,6 +272,8 @@ const RETRYABLE_STATUSES = [0, 502, 503, 504];
       .choice.selected { border-color: #2c7; background: #eafaf1; }
       .waiting { color: #777; text-align: center; margin-top: 2rem; }
       .saved { color: #2c7; margin-top: 1rem; }
+      .rename { text-align: center; margin-top: 2rem; }
+      .rename button { background: none; border: none; color: #777; text-decoration: underline; }
       .sending { color: #777; margin-top: 1rem; }
       .error { color: #c0392b; }
       .hist { display: flex; flex-direction: column; gap: 0.7rem; margin-top: 0.5rem; }
@@ -278,6 +332,19 @@ export class StudentSessionComponent implements OnInit, OnDestroy {
   /** The round the drafts belong to; a new round starts them afresh. */
   private draftRound: number | null = null;
   error = signal<string>('');
+  /** In a competition: this student's nickname, score and place. */
+  standing = signal<Standing | null>(null);
+  standingLoaded = signal(false);
+  /** The closed round `standing` was fetched after, so a stale verdict is never shown. */
+  standingRound = signal<number | null>(null);
+  renaming = signal(false);
+  nicknameError = signal('');
+  nicknameBusy = signal(false);
+  /** When the last state arrived, and the time now, for the competition clock. */
+  private receivedAt = 0;
+  private now = signal(Date.now());
+  private clock?: ReturnType<typeof setInterval>;
+  private standingTimer?: ReturnType<typeof setTimeout>;
   sending = signal(false);
   sendError = signal<string>('');
   private code = '';
@@ -305,6 +372,64 @@ export class StudentSessionComponent implements OnInit, OnDestroy {
 
   ngOnDestroy(): void {
     this.teardown?.();
+    if (this.clock) clearInterval(this.clock);
+    clearTimeout(this.standingTimer);
+  }
+
+  /** Milliseconds left on the open question's clock, by the server's reckoning. */
+  clockLeft(): number {
+    return msLeft(this.state(), this.receivedAt, this.now());
+  }
+
+  chooseNickname(nickname: string): void {
+    this.nicknameBusy.set(true);
+    this.nicknameError.set('');
+    this.api.setNickname(this.code, nickname).subscribe({
+      next: ({ nickname: saved }) => {
+        this.nicknameBusy.set(false);
+        this.renaming.set(false);
+        this.standing.update((st) => (st ? { ...st, nickname: saved } : st));
+        this.loadStanding(this.state()?.closed_round?.id ?? null);
+      },
+      error: (err) => {
+        this.nicknameBusy.set(false);
+        this.nicknameError.set(err?.error?.detail ?? 'Could not save that nickname.');
+      },
+    });
+  }
+
+  private loadStanding(afterRound: number | null): void {
+    this.api.standing(this.code).subscribe({
+      next: (st) => {
+        this.standing.set(st);
+        this.standingRound.set(afterRound);
+        this.standingLoaded.set(true);
+      },
+      error: () => this.standingLoaded.set(true),
+    });
+  }
+
+  /**
+   * Keep the competition's side of the page current: the clock while a
+   * question is open, and the standing once one closes — fetched after a
+   * random pause, because every phone in the room learns of the close at once.
+   */
+  private followCompetition(s: SessionState): void {
+    if (!this.clock) {
+      this.clock = setInterval(() => this.now.set(Date.now()), CLOCK_TICK_MS);
+    }
+    if (!this.standingLoaded()) {
+      this.loadStanding(s.open_round ? null : (s.closed_round?.id ?? null));
+      return;
+    }
+    const closed = s.open_round ? null : (s.closed_round?.id ?? null);
+    if (closed !== null && closed !== this.standingRound()) {
+      clearTimeout(this.standingTimer);
+      this.standingTimer = setTimeout(
+        () => this.loadStanding(closed),
+        Math.random() * STANDING_SPREAD_MS,
+      );
+    }
   }
 
   /**
@@ -348,7 +473,9 @@ export class StudentSessionComponent implements OnInit, OnDestroy {
   }
 
   private applyState(s: SessionState): void {
+    this.receivedAt = Date.now();
     this.state.set(s);
+    if (s.competition) this.followCompetition(s);
     // While a round is open the server tells us our own answer; trust it over
     // local state. Once it closes the server no longer sends it, and the last
     // one is kept so the results can mark what this student picked.
@@ -508,6 +635,12 @@ export class StudentSessionComponent implements OnInit, OnDestroy {
           // Say so plainly and leave the choices tappable: the answer was not
           // recorded, and the student is the only one who can send it again.
           this.sendError.set('Too many at once — tap your answer again.');
+          return;
+        }
+        if (err?.error?.detail === 'Choose a nickname first') {
+          // The teacher took the nickname down: ask for another.
+          this.standing.update((st) => (st ? { ...st, nickname: null } : st));
+          this.sendError.set('');
           return;
         }
         if (err?.status === 409 && err?.error?.detail && err.error.detail !== 'No round is open'
