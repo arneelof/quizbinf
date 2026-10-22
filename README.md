@@ -20,6 +20,7 @@ answer.
   points for right and fast answers, and an animated leaderboard of
   *nicknames* between questions, ending on a podium. Start it with
   *🏆 Competition* on the dashboard; the projected screen is the *Game* view.
+  Try it without logging in at `/demo/competition`.
 
 ## Stack
 

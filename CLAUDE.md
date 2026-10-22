@@ -517,6 +517,14 @@ and `e2e/competition.spec.mjs`:
   (`GET /leaderboard`) is teacher-only: the projected view shows the top five
   and the podium, and the bottom of the table is nobody else's business.
 
+**`/demo/competition` plays a whole game in the browser**, no login and
+nothing sent (`demo/demo-competition.component.ts`): the visitor's phone
+against eight made-up players, on the same tiles, leaderboard and podium
+components as the real Game view. `demo/demo-game.ts` scores and ranks by the
+same rules as `service.py`, and `demo-game.spec.ts` holds the two to the same
+numbers. `?seconds=` shortens the clock and `?seed=` repeats a game exactly,
+which is how `e2e/demo-competition.spec.mjs` drives it.
+
 The clock on a phone is drawn from `round_deadline` and `server_time` in the
 state snapshot (`msLeft` in `models.ts`): the device only has to measure how
 much time has *passed* since the snapshot arrived, so a phone whose clock is

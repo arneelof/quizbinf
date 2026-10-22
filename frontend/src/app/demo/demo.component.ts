@@ -1,4 +1,5 @@
 import { Component, computed, signal } from '@angular/core';
+import { RouterLink } from '@angular/router';
 
 import { AnswerInput, Question, QuestionKind, RoundResult } from '../models';
 import { ResultViewComponent } from '../shared/result-view.component';
@@ -105,7 +106,7 @@ const QUESTIONS: DemoQuestion[] = [
 @Component({
   selector: 'app-demo',
   standalone: true,
-  imports: [ResultViewComponent],
+  imports: [ResultViewComponent, RouterLink],
   template: `
     <div class="wrap">
       <h1>Try the lecture quiz</h1>
@@ -113,6 +114,7 @@ const QUESTIONS: DemoQuestion[] = [
         This is how students answer during a lecture (left), and what the projector shows when the
         teacher halts the question (right). Answer as a student: the results combine your answer with
         made-up answers from 23 classmates. Nothing is sent or stored.
+        <a routerLink="/demo/competition">Or play a competition 🏆</a>
       </p>
       <nav class="steps">
         @for (d of questions; track d.question.id; let i = $index) {

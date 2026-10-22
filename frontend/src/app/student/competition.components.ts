@@ -114,7 +114,9 @@ export class CountdownBarComponent {
               color: #fff; font-size: 1rem; font-weight: 700; box-shadow: 0 5px 0 rgba(0, 0, 0, 0.25);
               transition: transform 0.15s, opacity 0.3s; }
       .tile:active:not(:disabled) { transform: translateY(3px); }
-      .tile:disabled { cursor: default; }
+      /* Locked, not unavailable: the global faded look for a disabled button
+         would dim the pick too, and the pick is what should stand out. */
+      .tile:disabled { cursor: default; opacity: 1; }
       .tile.picked { outline: 4px solid #222; transform: scale(1.03); }
       .tile.other { opacity: 0.3; }
       .shape { font-size: 2.4rem; line-height: 1; }

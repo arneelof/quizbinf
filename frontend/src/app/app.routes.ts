@@ -14,6 +14,12 @@ export const routes: Routes = [
       import('./student/session.component').then((m) => m.StudentSessionComponent),
   },
   {
+    // Competition mode, played in the browser against made-up players; no login.
+    path: 'demo/competition',
+    loadComponent: () =>
+      import('./demo/demo-competition.component').then((m) => m.DemoCompetitionComponent),
+  },
+  {
     // A public demo of the question kinds; runs in the browser, needs no login.
     path: 'demo',
     loadComponent: () => import('./demo/demo.component').then((m) => m.DemoComponent),
