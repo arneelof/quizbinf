@@ -591,11 +591,20 @@ def sessions_in_range(
     happened — and nothing in the app deletes a session, so the damage would
     stand. Filtering at the source means a report added later inherits the
     exclusion instead of having to remember it.
+
+    Competitions are excluded for a related reason: a game is not a lecture.
+    It asks each question once, against a clock, and only of students who
+    picked a nickname, so counting it would put an end-of-term game in the
+    Canvas denominator and score a student who sat it out as absent.
     """
     query = (
         select(QuizSession)
         .join(Quiz, QuizSession.quiz_id == Quiz.id)
-        .where(QuizSession.is_loadtest.is_(False), QuizSession.is_anonymous.is_(False))
+        .where(
+            QuizSession.is_loadtest.is_(False),
+            QuizSession.is_anonymous.is_(False),
+            QuizSession.is_competition.is_(False),
+        )
         .order_by(QuizSession.created_at, QuizSession.id)
     )
     # With shared quizzes every teacher reports on every lecture; otherwise a
@@ -1566,6 +1575,15 @@ def set_nickname(db: Session, session: QuizSession, user: User, raw: str) -> str
     if not session.is_competition:
         raise RuleViolation("Nicknames are only used in competitions")
     nickname = clean_nickname(raw)
+    # Check-then-write: two phones picking "Alice" at once would both see it
+    # free. On Postgres the write gate does not serialise, so the check queues
+    # on the session row instead, which also orders it before the insert
+    # below. NO KEY UPDATE, not UPDATE: students joining insert rows that
+    # reference this session, and a plain FOR UPDATE would hold them all up.
+    # SQLite ignores the lock and has the gate.
+    db.execute(
+        select(QuizSession.id).where(QuizSession.id == session.id).with_for_update(key_share=True)
+    )
     taken = db.scalar(
         select(SessionParticipant.id).where(
             SessionParticipant.session_id == session.id,
@@ -1575,15 +1593,20 @@ def set_nickname(db: Session, session: QuizSession, user: User, raw: str) -> str
     )
     if taken is not None:
         raise RuleViolation("That nickname is taken — pick another")
+    # The row usually exists already (`/state` writes it on arrival), but may
+    # be inserted by that very request at the same moment: insert it if absent
+    # without racing it, as `record_participant` does, then set the name.
+    now = utcnow()
+    insert_ignoring_conflict(
+        db, SessionParticipant, session_id=session.id, user_id=user.id,
+        joined_at=now, last_seen_at=now,
+    )
     participant = db.scalar(
         select(SessionParticipant).where(
             SessionParticipant.session_id == session.id,
             SessionParticipant.user_id == user.id,
         )
     )
-    if participant is None:
-        participant = SessionParticipant(session_id=session.id, user_id=user.id)
-        db.add(participant)
     participant.nickname = nickname
     db.commit()
     return nickname

@@ -15,17 +15,23 @@ test('round controls appear when two quizzes share a title', async ({ browser })
   await page.getByRole('button', { name: 'Log in' }).click();
   await page.waitForURL('**/teacher');
 
+  // Only this test's quizzes: the e2e server is shared, and earlier tests
+  // sign in as the same teacher and leave quizzes of their own behind.
+  const mine = page
+    .locator('section.quiz')
+    .filter({ has: page.getByRole('heading', { name: 'Lecture 3', exact: true }) });
+
   // First quiz with this title — deliberately left without questions.
   await page.fill('input[name="title"]', 'Lecture 3');
   await page.click('form.new-quiz button');
-  await page.waitForSelector('section.quiz');
+  await expect(mine).toHaveCount(1);
 
   // Second quiz, same title, with the question we actually want to run.
   await page.fill('input[name="title"]', 'Lecture 3');
   await page.click('form.new-quiz button');
-  await expect(page.locator('section.quiz')).toHaveCount(2);
+  await expect(mine).toHaveCount(2);
 
-  const second = page.locator('section.quiz').nth(1);
+  const second = mine.nth(1);
   await second.locator('details summary').click();
   await second.locator('textarea[name="qtext"]').fill('Which aligns locally?');
   const inputs = second.locator('.add-q input[placeholder="Choice text"]');

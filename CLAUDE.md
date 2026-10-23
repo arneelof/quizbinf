@@ -504,7 +504,18 @@ and `e2e/competition.spec.mjs`:
   at most 20 printable characters, and it is the only name a competition
   projects. The real name stays on the Participants view. The teacher can
   take a nickname down from the lobby (`DELETE /players/{id}/nickname`); the
-  student keeps their points and is asked for another.
+  student keeps their points and is asked for another. Uniqueness is a
+  read-then-write, so on Postgres `set_nickname` first locks the session row
+  (`FOR NO KEY UPDATE`, which does not hold up students joining) and inserts
+  the participant row with `insert_ignoring_conflict`, since `/state` may be
+  inserting it in the same instant. Without both, a class choosing at once
+  gave three players "Alice" and some a 500;
+  `test_one_nickname_goes_to_one_player_on_postgres` pins it.
+- **A game is not a lecture.** `sessions_in_range` leaves competitions out,
+  as it does rehearsals and anonymous sessions, so neither term report nor
+  the Canvas file counts one: a game asks each question once and only of
+  students who picked a nickname, and counting it would mark everyone who
+  sat it out absent.
 - **Nothing moves while the clock runs.** The leaderboard counts *closed*
   rounds only, and the projected screen shows how many have answered, not
   how. The right answer is marked once the round is closed — in a

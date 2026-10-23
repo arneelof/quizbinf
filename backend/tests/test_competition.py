@@ -6,7 +6,10 @@ leaderboard ranks *nicknames* over closed rounds only — never real names, and
 never moving while a question is open.
 """
 
+import os
 from datetime import timedelta
+
+import pytest
 
 from app import service
 from app.db import SessionLocal, writing
@@ -304,3 +307,115 @@ def test_results_at_the_end_are_shown_after_the_one_round(teacher_client, make_c
     _close(teacher_client, code, round_id)
     state = alice.get(f"/api/sessions/{code}/state").json()
     assert state["closed_round_histogram"][str(choices[0])] == 1
+
+
+def test_a_game_is_not_a_lecture_in_the_attendance_reports(teacher_client, make_client):
+    """A game asks each question once, against a clock, of whoever picked a
+    nickname. Counted as a lecture it would enter the Canvas denominator and
+    mark everybody who sat it out absent."""
+    lecture_quiz, [(lq, lchoices)] = _quiz(teacher_client)
+    anna = make_client()
+    login(anna, "anna")
+    lecture = teacher_client.post(f"/api/sessions?quiz_id={lecture_quiz}").json()["code"]
+    anna.get(f"/api/sessions/{lecture}/state")
+    rid = _open(teacher_client, lecture, lq)
+    anna.post(f"/api/sessions/{lecture}/answers", json={"choice_id": lchoices[0]})
+    _close(teacher_client, lecture, rid)
+
+    code, [(qid, choices)] = _game(teacher_client)
+    alice = _player(make_client, code, "alice", "Speedy")
+    rid = _open(teacher_client, code, qid)
+    alice.post(f"/api/sessions/{code}/answers", json={"choice_id": choices[0]})
+    _close(teacher_client, code, rid)
+
+    report = teacher_client.get("/api/reports/participation").json()
+    assert len(report["sessions"]) == 1, "the game counted as a lecture"
+    assert "alice" not in {r["username"] for r in report["students"]}
+    csv = teacher_client.get("/api/reports/canvas-participation.csv").text
+    assert "anna" in csv and "alice" not in csv
+
+
+# --- nicknames under contention, against a real Postgres -------------------
+
+POSTGRES_URL = os.environ.get("QUIZBINF_TEST_POSTGRES_URL")
+
+
+@pytest.mark.skipif(not POSTGRES_URL, reason="set QUIZBINF_TEST_POSTGRES_URL to run")
+def test_one_nickname_goes_to_one_player_on_postgres():
+    """Where the write gate is off, so nothing but the code orders the check
+    before the write. A class asking for one name at the same moment — each
+    student also arriving through `/state` at that moment, which inserts the
+    participant row `set_nickname` may be inserting too — must hand it to
+    exactly one, refuse the rest with the rule, and fail nobody with a 500."""
+    from sqlalchemy import create_engine, func, select
+    from sqlalchemy.orm import sessionmaker
+
+    from app import auth
+    from app import db as db_module
+    from app.db import Base
+    from app.models import Role, SessionParticipant, User
+    from tests.test_concurrent_writes import _settings, make_lecture, run_together
+
+    engine = create_engine(POSTGRES_URL)
+    Base.metadata.create_all(engine)
+    Sessions = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    was = db_module._serialise_writes
+    db_module._serialise_writes = False  # what a Postgres deployment does
+    players = 20
+    try:
+        setup = Sessions()
+        session, _ = make_lecture(setup, f"nick{os.getpid()}")
+        with writing(setup):
+            setup.get(QuizSession, session.id).is_competition = True
+            users = [auth._create_user(setup, f"n{i}", f"N{i}", Role.student)
+                     for i in range(players)]
+            setup.commit()
+        setup.close()
+
+        won: list[int] = []
+        errors: list[BaseException] = []
+
+        def arrive(user_id):
+            db = Sessions()
+            try:
+                user = db.get(User, user_id)
+                service.record_participant(db, db.get(QuizSession, session.id), user)
+            except BaseException as e:  # noqa: BLE001
+                errors.append(e)
+            finally:
+                db.close()
+
+        def claim(user_id):
+            db = Sessions()
+            try:
+                service.set_nickname(db, db.get(QuizSession, session.id),
+                                     db.get(User, user_id), "Alice")
+                won.append(user_id)
+            except service.RuleViolation:
+                pass  # taken: the student is asked for another
+            except BaseException as e:  # noqa: BLE001
+                errors.append(e)
+            finally:
+                db.close()
+
+        calls = []
+        for u in users:
+            calls += [lambda i=u.id: arrive(i), lambda i=u.id: claim(i)]
+        run_together(calls)
+        assert not errors, errors[:3]
+        assert len(won) == 1, f"{len(won)} players were given the same nickname"
+
+        check = Sessions()
+        named = check.scalar(
+            select(func.count()).select_from(SessionParticipant).where(
+                SessionParticipant.session_id == session.id,
+                func.lower(SessionParticipant.nickname) == "alice"))
+        rows = check.scalar(
+            select(func.count()).select_from(SessionParticipant).where(
+                SessionParticipant.session_id == session.id))
+        check.close()
+        assert (named, rows) == (1, players)
+    finally:
+        db_module._serialise_writes = was
+        Base.metadata.drop_all(engine)
+        engine.dispose()
